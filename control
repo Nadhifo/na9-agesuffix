@@ -1,0 +1,9 @@
+Package: com.na9.agesuffix
+Name: NA9 Age Suffix
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Adds the post age (4h, 3d, ...) after the upload date shown by NA9 TikTok
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
