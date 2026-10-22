@@ -1,15 +1,23 @@
-// NA9AgeSuffix
-// Menambahkan umur postingan ("4h", "3d", ...) di belakang teks tanggal upload
-// yang ditampilkan NA9 TikTok, mis. "22/10/26, 04.31" -> "22/10/26, 04.31 - 4h".
-// Murni Objective-C runtime (tanpa Substrate/ElleKit), jadi bisa dipakai lewat
-// TrollFools maupun jailbreak.
+// NA9AgeSuffix v1.1
+// Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
+//   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
+//
+// Cara utama : mengait +[TTKHelperTools formattedDateTime:] (milik NA9TikTok.dylib).
+//              Method itu menerima NSDate upload dan mengembalikan teks tanggal,
+//              jadi umur dihitung dari NSDate aslinya (tanpa parsing teks).
+// Cadangan   : mengait UILabel setText:/setAttributedText: dan menempelkan umur bila
+//              teksnya berbentuk tanggal (dipakai kalau kait utama gagal terpasang).
+// Murni Objective-C runtime, tidak butuh Substrate/ElleKit.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
 
 static NSRegularExpression *gRegex;
 static NSArray<NSDateFormatter *> *gFormatters;
+static BOOL gMainHooked = NO;
 
+static NSString *(*orig_formattedDateTime)(id, SEL, NSDate *);
 static void (*orig_setText)(id, SEL, NSString *);
 static void (*orig_setAttributedText)(id, SEL, NSAttributedString *);
 
@@ -26,16 +34,46 @@ static NSString *NA9AgeString(NSTimeInterval s) {
     return [NSString stringWithFormat:@"%ldy", d / 365];
 }
 
-// Mengembalikan "<teks asli> - <umur>" bila teks adalah tanggal upload, selain itu nil.
+// ---------- Kait utama: +[TTKHelperTools formattedDateTime:] ----------
+static NSString *new_formattedDateTime(id self, SEL _cmd, NSDate *date) {
+    NSString *s = orig_formattedDateTime(self, _cmd, date);
+    if (![s isKindOfClass:[NSString class]] || ![date isKindOfClass:[NSDate class]]) return s;
+    if (s.length == 0) return s;
+    return [NSString stringWithFormat:@"%@ - %@", s, NA9AgeString(-[date timeIntervalSinceNow])];
+}
+
+static void NA9TryHookMain(void) {
+    @synchronized ([UIApplication class]) {
+        if (gMainHooked) return;
+        Class c = NSClassFromString(@"TTKHelperTools");
+        if (!c) return;
+        Method m = class_getClassMethod(c, @selector(formattedDateTime:));
+        if (!m) return;
+        orig_formattedDateTime = (NSString *(*)(id, SEL, NSDate *))method_getImplementation(m);
+        method_setImplementation(m, (IMP)new_formattedDateTime);
+        gMainHooked = YES;
+        NSLog(@"[NA9AgeSuffix] main hook installed");
+    }
+}
+
+static void NA9ImageAdded(const struct mach_header *mh, intptr_t slide) {
+    if (!gMainHooked) NA9TryHookMain();
+}
+
+// ---------- Cadangan: tempel umur pada teks UILabel yang berbentuk tanggal ----------
 static NSString *NA9Decorate(NSString *text) {
+    if (gMainHooked) return nil;                       // kait utama sudah aktif
     if (![text isKindOfClass:[NSString class]]) return nil;
     NSUInteger len = text.length;
-    if (len < 12 || len > 20) return nil;                       // saring cepat
+    if (len < 12 || len > 22) return nil;
     unichar c0 = [text characterAtIndex:0];
     if (c0 < '0' || c0 > '9') return nil;
     if ([gRegex firstMatchInString:text options:0 range:NSMakeRange(0, len)] == nil) return nil;
+    // Samakan semua jenis spasi (NBSP, narrow NBSP, dll) menjadi spasi biasa
+    NSString *norm = [gRegex stringByReplacingMatchesInString:text options:0
+                          range:NSMakeRange(0, len) withTemplate:@"$1/$2/$3, $4$5$6"];
     for (NSDateFormatter *f in gFormatters) {
-        NSDate *date = [f dateFromString:text];
+        NSDate *date = [f dateFromString:norm];
         if (date) {
             return [NSString stringWithFormat:@"%@ - %@", text,
                     NA9AgeString(-[date timeIntervalSinceNow])];
@@ -63,14 +101,17 @@ static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
 
 __attribute__((constructor)) static void NA9AgeInit(void) {
     @autoreleasepool {
+        NSLog(@"[NA9AgeSuffix] loaded");
+
+        // Kelompok: 1=dd 2=MM 3=yy(yy) 4=jam 5=pemisah 6=menit; spasi di antaranya longgar
         gRegex = [NSRegularExpression
-            regularExpressionWithPattern:@"^\\d{1,2}/\\d{1,2}/\\d{2,4}, \\d{1,2}[.:]\\d{2}$"
+            regularExpressionWithPattern:@"^(\\d{1,2})/(\\d{1,2})/(\\d{2,4}),\\s*(\\d{1,2})([.:])(\\d{2})$"
                                  options:0 error:nil];
 
-        // Pola tanggal yang dicoba, urut. Tambahkan di sini kalau "Date format" NA9 kamu ubah.
         NSArray *patterns = @[ @"dd/MM/yy, HH.mm", @"dd/MM/yyyy, HH.mm",
                                @"dd/MM/yy, HH:mm", @"dd/MM/yyyy, HH:mm",
-                               @"d/M/yy, H.mm",    @"d/M/yyyy, H.mm" ];
+                               @"d/M/yy, H.mm",    @"d/M/yyyy, H.mm",
+                               @"d/M/yy, H:mm",    @"d/M/yyyy, H:mm" ];
         NSLocale *posix = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
         NSMutableArray *fs = [NSMutableArray array];
         for (NSString *p in patterns) {
@@ -89,5 +130,9 @@ __attribute__((constructor)) static void NA9AgeInit(void) {
         Method m2 = class_getInstanceMethod([UILabel class], @selector(setAttributedText:));
         orig_setAttributedText = (void (*)(id, SEL, NSAttributedString *))method_getImplementation(m2);
         method_setImplementation(m2, (IMP)new_setAttributedText);
+
+        // Kait utama: coba sekarang, dan setiap kali ada image baru dimuat (NA9 bisa dimuat belakangan).
+        NA9TryHookMain();
+        _dyld_register_func_for_add_image(NA9ImageAdded);
     }
 }
