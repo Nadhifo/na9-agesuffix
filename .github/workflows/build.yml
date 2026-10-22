@@ -1,0 +1,20 @@
+name: Build NA9AgeSuffix deb
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install ldid dpkg
+      - name: Build
+        run: ./build.sh
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: NA9AgeSuffix
+          path: |
+            build/*.deb
+            build/NA9AgeSuffix.dylib
