@@ -8,9 +8,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
-        run: brew install ldid dpkg
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install ldid dpkg
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-path
+          which ldid dpkg-deb
       - name: Build
-        run: ./build.sh
+        run: bash -x build.sh
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
