@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.2
+// NA9AgeSuffix v1.3-probe
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -125,10 +125,103 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
     }
 }
 
+// ---------- PROBE (sementara): baca struktur halaman "You may like" / "Trending searches" ----------
+// Saat label dengan teks tsb muncul, tampilkan alert berisi rantai view/cell/controller-nya.
+// Setelah informasinya terkumpul, set NA9_PROBE ke 0 (atau pakai versi final dari saya).
+#define NA9_PROBE 1
+#if NA9_PROBE
+static NSHashTable<UILabel *> *gProbeLabels;
+static BOOL gProbeScheduled = NO, gProbeDone = NO;
+
+static NSString *NA9Chain(UIView *v) {
+    NSMutableArray *parts = [NSMutableArray array];
+    UIView *p = v;
+    for (int i = 0; p && i < 14; i++, p = p.superview) [parts addObject:NSStringFromClass([p class])];
+    return [parts componentsJoinedByString:@" < "];
+}
+
+static NSString *NA9Describe(UILabel *l) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"\"%@\" [%@]\n", l.text ?: l.attributedText.string, NSStringFromClass([l class])];
+    [s appendFormat:@"views: %@\n", NA9Chain(l)];
+    UIView *cell = nil, *p = l;
+    UITableView *tv = nil; UICollectionView *cv = nil;
+    while (p) {
+        if (!cell && ([p isKindOfClass:[UITableViewCell class]] ||
+                      [p isKindOfClass:[UITableViewHeaderFooterView class]] ||
+                      [p isKindOfClass:[UICollectionReusableView class]])) cell = p;
+        if ([p isKindOfClass:[UITableView class]]) { tv = (UITableView *)p; break; }
+        if ([p isKindOfClass:[UICollectionView class]]) { cv = (UICollectionView *)p; break; }
+        p = p.superview;
+    }
+    if (cell) [s appendFormat:@"cell: %@\n", NSStringFromClass([cell class])];
+    if (tv) [s appendFormat:@"table: %@ ds=%@ delegate=%@\n", NSStringFromClass([tv class]),
+             NSStringFromClass([tv.dataSource class]), NSStringFromClass([tv.delegate class])];
+    if (cv) [s appendFormat:@"collection: %@ layout=%@ ds=%@ delegate=%@\n", NSStringFromClass([cv class]),
+             NSStringFromClass([cv.collectionViewLayout class]),
+             NSStringFromClass([cv.dataSource class]), NSStringFromClass([cv.delegate class])];
+    NSMutableArray *vcs = [NSMutableArray array];
+    UIResponder *r = l;
+    while (r && ![r isKindOfClass:[UIViewController class]]) r = r.nextResponder;
+    UIViewController *vc = (UIViewController *)r;
+    while (vc) { [vcs addObject:NSStringFromClass([vc class])]; vc = vc.parentViewController; }
+    [s appendFormat:@"controllers: %@\n", [vcs componentsJoinedByString:@" < "]];
+    return s;
+}
+
+static UIViewController *NA9TopVC(void) {
+    UIWindow *win = nil;
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) win = w;
+    }
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    return top;
+}
+
+static void NA9ProbeShow(void) {
+    if (gProbeDone) return;
+    NSMutableString *msg = [NSMutableString string];
+    for (UILabel *l in gProbeLabels.allObjects) {
+        if (!l.window) continue;
+        [msg appendString:NA9Describe(l)];
+        [msg appendString:@"\n"];
+    }
+    if (msg.length == 0) { gProbeScheduled = NO; return; }
+    UIViewController *top = NA9TopVC();
+    if (!top) { gProbeScheduled = NO; return; }
+    gProbeDone = YES;
+    NSString *copy = [msg copy];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"NA9 Probe"
+                                                               message:copy
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) { [UIPasteboard generalPasteboard].string = copy; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [top presentViewController:a animated:YES completion:nil];
+}
+
+static void NA9ProbeNote(UILabel *l, NSString *text) {
+    if (gProbeDone || ![text isKindOfClass:[NSString class]]) return;
+    if (![text isEqualToString:@"You may like"] && ![text isEqualToString:@"Trending searches"]) return;
+    if (!gProbeLabels) gProbeLabels = [NSHashTable weakObjectsHashTable];
+    [gProbeLabels addObject:l];
+    if (gProbeScheduled) return;
+    gProbeScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NA9ProbeShow();
+    });
+}
+#else
+static void NA9ProbeNote(UILabel *l, NSString *text) {}
+#endif
+
 static void new_setText(id self, SEL _cmd, NSString *text) {
     NSString *decorated = NA9Decorate(text);
     orig_setText(self, _cmd, decorated ?: text);
     NA9HideNullCell(self, text);
+    NA9ProbeNote(self, text);
 }
 
 static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
@@ -142,6 +235,7 @@ static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
     }
     orig_setAttributedText(self, _cmd, text);
     NA9HideNullCell(self, text.string);
+    NA9ProbeNote(self, text.string);
 }
 
 __attribute__((constructor)) static void NA9AgeInit(void) {
