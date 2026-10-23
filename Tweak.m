@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.1
+// NA9AgeSuffix v1.2
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -7,6 +7,8 @@
 //              jadi umur dihitung dari NSDate aslinya (tanpa parsing teks).
 // Cadangan   : mengait UILabel setText:/setAttributedText: dan menempelkan umur bila
 //              teksnya berbentuk tanggal (dipakai kalau kait utama gagal terpasang).
+// Tambahan v1.2: menyembunyikan kartu kosong "(null)" di hasil pencarian (sisa slot iklan
+//              yang isinya dibuang fitur "Remove ads" NA9). Best-effort, lihat NA9HideNullCell.
 // Murni Objective-C runtime, tidak butuh Substrate/ElleKit.
 
 #import <UIKit/UIKit.h>
@@ -82,9 +84,51 @@ static NSString *NA9Decorate(NSString *text) {
     return nil;
 }
 
+
+// ---------- Sembunyikan kartu "(null)" (sisa slot iklan) ----------
+static const void *kNA9NullLabelKey = &kNA9NullLabelKey;  // dipasang di UILabel pemicu
+static const void *kNA9HiddenByKey  = &kNA9HiddenByKey;   // dipasang di cell: label pemicu
+
+static UICollectionViewCell *NA9EnclosingCell(UIView *v) {
+    UIView *p = v;
+    for (int i = 0; i < 12 && p; i++, p = p.superview) {
+        if ([p isKindOfClass:[UICollectionViewCell class]]) return (UICollectionViewCell *)p;
+    }
+    return nil;
+}
+
+// text == persis "(null)"  -> sembunyikan cell pembungkus label ini.
+// label yang sama berganti ke teks lain (cell dipakai ulang) -> tampilkan lagi.
+static void NA9HideNullCell(UILabel *label, NSString *text) {
+    if (![label isKindOfClass:[UILabel class]]) return;
+    BOOL isNull = [text isKindOfClass:[NSString class]] && [text isEqualToString:@"(null)"];
+    if (isNull) {
+        UICollectionViewCell *cell = NA9EnclosingCell(label);
+        if (!cell) return;
+        objc_setAssociatedObject(label, kNA9NullLabelKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cell, kNA9HiddenByKey,
+                                 [NSValue valueWithPointer:(__bridge const void *)label],
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        cell.hidden = YES;
+        cell.userInteractionEnabled = NO;
+        return;
+    }
+    if (objc_getAssociatedObject(label, kNA9NullLabelKey)) {
+        objc_setAssociatedObject(label, kNA9NullLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UICollectionViewCell *cell = NA9EnclosingCell(label);
+        NSValue *owner = cell ? objc_getAssociatedObject(cell, kNA9HiddenByKey) : nil;
+        if (owner && owner.pointerValue == (__bridge const void *)label) {
+            objc_setAssociatedObject(cell, kNA9HiddenByKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            cell.hidden = NO;
+            cell.userInteractionEnabled = YES;
+        }
+    }
+}
+
 static void new_setText(id self, SEL _cmd, NSString *text) {
     NSString *decorated = NA9Decorate(text);
     orig_setText(self, _cmd, decorated ?: text);
+    NA9HideNullCell(self, text);
 }
 
 static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
@@ -97,6 +141,7 @@ static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
         text = m;
     }
     orig_setAttributedText(self, _cmd, text);
+    NA9HideNullCell(self, text.string);
 }
 
 __attribute__((constructor)) static void NA9AgeInit(void) {
