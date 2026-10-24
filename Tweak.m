@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.6
+// NA9AgeSuffix v1.6a
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -203,19 +203,18 @@ static BOOL NA9LabelIsTarget(UIView *v) {
 }
 
 // ---------- Sembunyikan "You may like" & "Trending searches" ----------
-// Mencari UILabel dengan teks tsb, lalu menyembunyikan daftar (table/collection/scroll view) yang
-// membungkusnya, sehingga halaman pencarian kosong seperti di RX. Daftar ditampilkan lagi bila
-// isinya berganti (mis. saat mengetik) atau halamannya ditutup.
-// Teks yang dikenali: bahasa Inggris. Set ke 0 untuk mematikan.
+// v1.7: dukung lebih dari satu daftar dan pulihkan saat pengguna mulai mengetik.
+// Catatan: container yang disembunyikan adalah table/collection/scroll view terdekat.
 #define NA9_HIDE_SEARCH_SUGGESTIONS 1
 #if NA9_HIDE_SEARCH_SUGGESTIONS
-static __weak UIView *gSugList = nil;
+static NSHashTable<UIView *> *gSugLists = nil; // weak references; dapat ada >1 container
 static BOOL gSugDiagShown = NO;
-static int gNodeBudget = 0;                 // batas jumlah view yang diperiksa per putaran
+static int gNodeBudget = 0;
+static const void *kNA9SugOriginalHiddenKey = &kNA9SugOriginalHiddenKey;
 
 static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
-    if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
-    if (NA9LabelIsTarget(v)) return (UILabel *)v;
+    if (!v || depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
+    if (NA9LabelIsTarget(v) && !objc_getAssociatedObject(v, @selector(NA9HideTick))) return (UILabel *)v;
     for (UIView *sv in v.subviews) {
         UILabel *r = NA9FindTargetLabel(sv, depth + 1);
         if (r) return r;
@@ -223,44 +222,135 @@ static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
     return nil;
 }
 
-static BOOL NA9ContainsTarget(UIView *v, int depth) {          // tanpa memeriksa hidden
-    if (depth > 70 || gNodeBudget-- <= 0) return NO;
+static BOOL NA9ContainsTarget(UIView *v, int depth) {
+    if (!v || depth > 70 || gNodeBudget-- <= 0) return NO;
     if (NA9LabelIsTarget(v)) return YES;
-    for (UIView *sv in v.subviews) if (NA9ContainsTarget(sv, depth + 1)) return YES;
+    for (UIView *sv in v.subviews) {
+        if (NA9ContainsTarget(sv, depth + 1)) return YES;
+    }
     return NO;
 }
 
 static UIView *NA9ListFor(UIView *label) {
     UIView *p = label.superview, *scroll = nil;
     while (p) {
-        if ([p isKindOfClass:[UITableView class]] || [p isKindOfClass:[UICollectionView class]]) return p;
+        if ([p isKindOfClass:[UITableView class]] ||
+            [p isKindOfClass:[UICollectionView class]]) return p;
         if (!scroll && [p isKindOfClass:[UIScrollView class]]) scroll = p;
         p = p.superview;
     }
     return scroll;
 }
 
+// Deteksi kolom pencarian yang sudah berisi teks. Saat mulai mengetik, pulihkan
+// daftar yang disembunyikan agar hasil pencarian tetap dapat tampil.
+static BOOL NA9SearchHasQueryInView(UIView *v, int depth) {
+    if (!v || depth > 70 || gNodeBudget-- <= 0) return NO;
+    if ([v isKindOfClass:[UISearchBar class]]) {
+        NSString *t = ((UISearchBar *)v).text;
+        if ([t isKindOfClass:[NSString class]] &&
+            [[t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] length] > 0)
+            return YES;
+    }
+    if ([v isKindOfClass:[UITextField class]]) {
+        NSString *t = ((UITextField *)v).text;
+        if ([t isKindOfClass:[NSString class]] &&
+            [[t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] length] > 0)
+            return YES;
+    }
+    for (UIView *sv in v.subviews) {
+        if (NA9SearchHasQueryInView(sv, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static void NA9RestoreSugLists(void) {
+    for (UIView *v in gSugLists.allObjects) {
+        NSNumber *wasHidden = objc_getAssociatedObject(v, kNA9SugOriginalHiddenKey);
+        if (wasHidden) {
+            v.hidden = wasHidden.boolValue;
+            objc_setAssociatedObject(v, kNA9SugOriginalHiddenKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+    [gSugLists removeAllObjects];
+}
+
+static void NA9HideSugList(UIView *v) {
+    if (!v) return;
+    if (!gSugLists) gSugLists = [NSHashTable weakObjectsHashTable];
+    if (!objc_getAssociatedObject(v, kNA9SugOriginalHiddenKey)) {
+        objc_setAssociatedObject(v, kNA9SugOriginalHiddenKey, @(v.hidden),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [gSugLists addObject:v];
+    }
+    v.hidden = YES;
+}
+
 static void NA9HideTick(void) {
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-    gNodeBudget = 6000;
-    UIView *list = gSugList;
-    if (list) {
-        if (list.window && NA9ContainsTarget(list, 0)) { if (!list.hidden) list.hidden = YES; return; }
-        list.hidden = NO;                                         // isi berganti / halaman ditutup
-        gSugList = nil;
+    if (!gSugLists) gSugLists = [NSHashTable weakObjectsHashTable];
+
+    // Jangan menutup daftar saat pengguna sudah mengetik; hasil pencarian perlu terlihat.
+    gNodeBudget = 12000;
+    BOOL hasQuery = NO;
+    for (UIWindow *w in NA9AllWindows()) {
+        if (NA9SearchHasQueryInView(w, 0)) { hasQuery = YES; break; }
     }
-    gNodeBudget = 6000;
-    UILabel *hit = nil;
-    for (UIWindow *w in NA9AllWindows()) { hit = NA9FindTargetLabel(w, 0); if (hit) break; }
-    if (!hit) return;
-    UIView *container = NA9ListFor(hit);
-    if (container) {
-        container.hidden = YES;
-        gSugList = container;
-    } else if (!gSugDiagShown && NA9TopVC() && !NA9TopVC().presentedViewController) {
-        gSugDiagShown = YES;
-        NA9PresentAlert(@"NA9: daftar tidak ditemukan",
-                        [NSString stringWithFormat:@"\"%@\"\n%@", ((UILabel *)hit).text, NA9Describe(hit)], YES);
+    if (hasQuery) {
+        NA9RestoreSugLists();
+        return;
+    }
+
+    // Pulihkan container yang sudah tidak memuat label target (mis. halaman Search ditutup
+    // atau UI berubah), pertahankan yang masih memuat target meskipun sedang hidden.
+    for (UIView *v in gSugLists.allObjects) {
+        gNodeBudget = 6000;
+        if (!v.window || !NA9ContainsTarget(v, 0)) {
+            NSNumber *wasHidden = objc_getAssociatedObject(v, kNA9SugOriginalHiddenKey);
+            if (wasHidden) v.hidden = wasHidden.boolValue;
+            objc_setAssociatedObject(v, kNA9SugOriginalHiddenKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [gSugLists removeObject:v];
+        } else {
+            v.hidden = YES;
+        }
+    }
+
+    // Bersihkan penanda pencarian sementara agar label yang dipakai ulang dapat terdeteksi lagi.
+    for (UIWindow *w in NA9AllWindows()) {
+        gNodeBudget = 12000;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        while (stack.count && gNodeBudget-- > 0) {
+            UIView *v = stack.lastObject; [stack removeLastObject];
+            objc_setAssociatedObject(v, @selector(NA9HideTick), nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [stack addObjectsFromArray:v.subviews];
+        }
+    }
+
+    // Cari kedua judul di seluruh window, bukan hanya label pertama yang ditemukan.
+    for (UIWindow *w in NA9AllWindows()) {
+        for (NSUInteger pass = 0; pass < 2; pass++) {
+            gNodeBudget = 6000;
+            UILabel *hit = NA9FindTargetLabel(w, 0);
+            if (!hit) break;
+            UIView *container = NA9ListFor(hit);
+            if (container) {
+                NA9HideSugList(container);
+                // Tandai label agar pencarian berikutnya di window ini tidak berulang pada
+                // container yang sama; label tidak diubah sehingga teks UI tetap asli.
+                objc_setAssociatedObject(hit, @selector(NA9HideTick), @YES,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                // Lanjutkan pencarian untuk menemukan judul kedua jika berada di container lain.
+            } else if (!gSugDiagShown && NA9TopVC() && !NA9TopVC().presentedViewController) {
+                gSugDiagShown = YES;
+                NA9PresentAlert(@"NA9: daftar tidak ditemukan",
+                                [NSString stringWithFormat:@"%@\n%@", hit.text ?: @"", NA9Describe(hit)], YES);
+                break;
+            } else {
+                break;
+            }
+        }
     }
 }
 #else
