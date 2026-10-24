@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.3-probe
+// NA9AgeSuffix v1.5
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -125,13 +125,28 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
     }
 }
 
-// ---------- PROBE (sementara): baca struktur halaman "You may like" / "Trending searches" ----------
-// Saat label dengan teks tsb muncul, tampilkan alert berisi rantai view/cell/controller-nya.
-// Setelah informasinya terkumpul, set NA9_PROBE ke 0 (atau pakai versi final dari saya).
-#define NA9_PROBE 1
-#if NA9_PROBE
-static NSHashTable<UILabel *> *gProbeLabels;
-static BOOL gProbeScheduled = NO, gProbeDone = NO;
+// ---------- Pembantu bersama (selalu dikompilasi) ----------
+static BOOL NA9IsTarget(NSString *t) {
+    NSString *l = t.lowercaseString;
+    return [l containsString:@"you may like"] || [l containsString:@"trending search"];
+}
+
+static NSArray<UIWindow *> *NA9AllWindows(void) {
+    NSMutableArray *ws = [NSMutableArray array];
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        [ws addObjectsFromArray:((UIWindowScene *)sc).windows];
+    }
+    return ws;
+}
+
+static UIViewController *NA9TopVC(void) {
+    UIWindow *win = nil;
+    for (UIWindow *w in NA9AllWindows()) if (w.isKeyWindow) win = w;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    return top;
+}
 
 static NSString *NA9Chain(UIView *v) {
     NSMutableArray *parts = [NSMutableArray array];
@@ -140,9 +155,8 @@ static NSString *NA9Chain(UIView *v) {
     return [parts componentsJoinedByString:@" < "];
 }
 
-static NSString *NA9Describe(UILabel *l) {
+static NSString *NA9Describe(UIView *l) {
     NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"\"%@\" [%@]\n", l.text ?: l.attributedText.string, NSStringFromClass([l class])];
     [s appendFormat:@"views: %@\n", NA9Chain(l)];
     UIView *cell = nil, *p = l;
     UITableView *tv = nil; UICollectionView *cv = nil;
@@ -169,59 +183,164 @@ static NSString *NA9Describe(UILabel *l) {
     return s;
 }
 
-static UIViewController *NA9TopVC(void) {
-    UIWindow *win = nil;
-    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) win = w;
-    }
-    UIViewController *top = win.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
-    return top;
-}
-
-static void NA9ProbeShow(void) {
-    if (gProbeDone) return;
-    NSMutableString *msg = [NSMutableString string];
-    for (UILabel *l in gProbeLabels.allObjects) {
-        if (!l.window) continue;
-        [msg appendString:NA9Describe(l)];
-        [msg appendString:@"\n"];
-    }
-    if (msg.length == 0) { gProbeScheduled = NO; return; }
+static void NA9PresentAlert(NSString *title, NSString *msg, BOOL withCopy) {
     UIViewController *top = NA9TopVC();
-    if (!top) { gProbeScheduled = NO; return; }
-    gProbeDone = YES;
-    NSString *copy = [msg copy];
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"NA9 Probe"
-                                                               message:copy
+    if (!top || top.presentedViewController) return;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault
-                                        handler:^(UIAlertAction *x) { [UIPasteboard generalPasteboard].string = copy; }]];
+    if (withCopy)
+        [a addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *x) { [UIPasteboard generalPasteboard].string = msg; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
     [top presentViewController:a animated:YES completion:nil];
 }
 
-static void NA9ProbeNote(UILabel *l, NSString *text) {
-    if (gProbeDone || ![text isKindOfClass:[NSString class]]) return;
-    if (![text isEqualToString:@"You may like"] && ![text isEqualToString:@"Trending searches"]) return;
-    if (!gProbeLabels) gProbeLabels = [NSHashTable weakObjectsHashTable];
-    [gProbeLabels addObject:l];
-    if (gProbeScheduled) return;
-    gProbeScheduled = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NA9ProbeShow();
-    });
+static BOOL NA9LabelIsTarget(UIView *v) {
+    if (![v isKindOfClass:[UILabel class]]) return NO;
+    UILabel *l = (UILabel *)v;
+    NSString *t = l.text ?: l.attributedText.string;
+    return t.length > 0 && NA9IsTarget(t);
+}
+
+// ---------- Sembunyikan "You may like" & "Trending searches" ----------
+// Mencari UILabel dengan teks tsb, lalu menyembunyikan daftar (table/collection/scroll view) yang
+// membungkusnya, sehingga halaman pencarian kosong seperti di RX. Daftar ditampilkan lagi bila
+// isinya berganti (mis. saat mengetik) atau halamannya ditutup.
+// Teks yang dikenali: bahasa Inggris. Set ke 0 untuk mematikan.
+#define NA9_HIDE_SEARCH_SUGGESTIONS 1
+#if NA9_HIDE_SEARCH_SUGGESTIONS
+static __weak UIView *gSugList = nil;
+static BOOL gSugDiagShown = NO;
+
+static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
+    if (depth > 70 || v.hidden || v.alpha < 0.01) return nil;
+    if (NA9LabelIsTarget(v)) return (UILabel *)v;
+    for (UIView *sv in v.subviews) {
+        UILabel *r = NA9FindTargetLabel(sv, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static BOOL NA9ContainsTarget(UIView *v, int depth) {          // tanpa memeriksa hidden
+    if (depth > 70) return NO;
+    if (NA9LabelIsTarget(v)) return YES;
+    for (UIView *sv in v.subviews) if (NA9ContainsTarget(sv, depth + 1)) return YES;
+    return NO;
+}
+
+static UIView *NA9ListFor(UIView *label) {
+    UIView *p = label.superview, *scroll = nil;
+    while (p) {
+        if ([p isKindOfClass:[UITableView class]] || [p isKindOfClass:[UICollectionView class]]) return p;
+        if (!scroll && [p isKindOfClass:[UIScrollView class]]) scroll = p;
+        p = p.superview;
+    }
+    return scroll;
+}
+
+static void NA9HideTick(void) {
+    UIView *list = gSugList;
+    if (list) {
+        if (list.window && NA9ContainsTarget(list, 0)) { if (!list.hidden) list.hidden = YES; return; }
+        list.hidden = NO;                                         // isi berganti / halaman ditutup
+        gSugList = nil;
+    }
+    UILabel *hit = nil;
+    for (UIWindow *w in NA9AllWindows()) { hit = NA9FindTargetLabel(w, 0); if (hit) break; }
+    if (!hit) return;
+    UIView *container = NA9ListFor(hit);
+    if (container) {
+        container.hidden = YES;
+        gSugList = container;
+    } else if (!gSugDiagShown && NA9TopVC() && !NA9TopVC().presentedViewController) {
+        gSugDiagShown = YES;
+        NA9PresentAlert(@"NA9: daftar tidak ditemukan",
+                        [NSString stringWithFormat:@"\"%@\"\n%@", ((UILabel *)hit).text, NA9Describe(hit)], YES);
+    }
 }
 #else
-static void NA9ProbeNote(UILabel *l, NSString *text) {}
+static void NA9HideTick(void) {}
 #endif
+
+// ---------- PROBE (opsional, untuk diagnosis) ----------
+// Set NA9_PROBE ke 1 bila perlu: alert "NA9 Probe aktif" ~5 dtk setelah TikTok dibuka, lalu alert
+// berisi rantai view untuk teks target (UILabel, view dengan -text/-attributedText, accessibilityLabel).
+#define NA9_PROBE 0
+#if NA9_PROBE
+static BOOL gProbeDone = NO, gHelloDone = NO;
+static NSDate *gProbeStart = nil;
+
+static NSString *NA9TextOf(UIView *v, NSString **via) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        NSString *t = l.text ?: l.attributedText.string;
+        if (t.length) { *via = @"UILabel"; return t; }
+    }
+    NSString *names[2] = { @"text", @"attributedText" };
+    for (int i = 0; i < 2; i++) {
+        SEL sel = NSSelectorFromString(names[i]);
+        if (![v respondsToSelector:sel]) continue;
+        NSMethodSignature *sig = [v methodSignatureForSelector:sel];
+        if (!sig || sig.numberOfArguments != 2 || sig.methodReturnType[0] != '@') continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id r = [v performSelector:sel];
+#pragma clang diagnostic pop
+        if ([r isKindOfClass:[NSString class]] && [r length]) { *via = [@"-" stringByAppendingString:names[i]]; return r; }
+        if ([r isKindOfClass:[NSAttributedString class]] && [r length]) { *via = [@"-" stringByAppendingString:names[i]]; return [(NSAttributedString *)r string]; }
+    }
+    NSString *ax = v.accessibilityLabel;
+    if (ax.length) { *via = @"accessibilityLabel"; return ax; }
+    return nil;
+}
+
+static void NA9Scan(UIView *v, NSMutableArray<UIView *> *hits, NSMutableArray<NSString *> *vias, int depth) {
+    if (depth > 70 || hits.count >= 4 || v.hidden || v.alpha < 0.01) return;
+    NSString *via = nil, *t = NA9TextOf(v, &via);
+    if (t && NA9IsTarget(t)) {
+        [hits addObject:v];
+        [vias addObject:[NSString stringWithFormat:@"%@ \"%@\" [%@]", via, t, NSStringFromClass([v class])]];
+    }
+    for (UIView *sv in v.subviews) NA9Scan(sv, hits, vias, depth + 1);
+}
+
+static void NA9ProbeTick(void) {
+    if (!gProbeStart) gProbeStart = [NSDate date];
+    if (!gHelloDone) {
+        if ([[NSDate date] timeIntervalSinceDate:gProbeStart] > 5 && NA9TopVC() && !NA9TopVC().presentedViewController) {
+            gHelloDone = YES;
+            NA9PresentAlert(@"NA9 Probe aktif", @"Dylib versi probe termuat. Buka halaman pencarian dan tunggu beberapa detik.", NO);
+        }
+        return;
+    }
+    if (gProbeDone) return;
+    NSMutableArray *hits = [NSMutableArray array], *vias = [NSMutableArray array];
+    for (UIWindow *w in NA9AllWindows()) NA9Scan(w, hits, vias, 0);
+    if (hits.count == 0 || !NA9TopVC() || NA9TopVC().presentedViewController) return;
+    NSMutableString *msg = [NSMutableString string];
+    for (NSUInteger i = 0; i < hits.count; i++)
+        [msg appendFormat:@"%@\n%@\n", vias[i], NA9Describe(hits[i])];
+    gProbeDone = YES;
+    NA9PresentAlert(@"NA9 Probe", msg, YES);
+}
+#else
+static void NA9ProbeTick(void) {}
+#endif
+
+static void NA9TimerStart(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) {
+            NA9HideTick();
+            NA9ProbeTick();
+        }];
+    });
+}
 
 static void new_setText(id self, SEL _cmd, NSString *text) {
     NSString *decorated = NA9Decorate(text);
     orig_setText(self, _cmd, decorated ?: text);
     NA9HideNullCell(self, text);
-    NA9ProbeNote(self, text);
 }
 
 static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
@@ -235,8 +354,52 @@ static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
     }
     orig_setAttributedText(self, _cmd, text);
     NA9HideNullCell(self, text.string);
-    NA9ProbeNote(self, text.string);
 }
+
+// ---------- Tanggal upload di samping nama akun (fitur bawaan TikTok) ----------
+// TikTok punya label waktu di samping nama akun di feed ("· 13h ago", "· 9-26") yang dikontrol
+// -shouldShowTimeStampLabel. Di sini method itu dipaksa mengembalikan YES (nama class tidak perlu
+// diketahui: semua class di dalam .app yang punya method itu ditambal, instance maupun class method).
+#define NA9_FEED_TIMESTAMPS 1
+#if NA9_FEED_TIMESTAMPS
+static BOOL na9_yes(id self, SEL _cmd) { return YES; }
+
+static void NA9PatchTimestampFlag(void) {
+    SEL sel = NSSelectorFromString(@"shouldShowTimeStampLabel");
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    for (unsigned int i = 0; i < n; i++) {
+        Class c = list[i];
+        const char *img = class_getImageName(c);
+        if (!img || !strstr(img, ".app/")) continue;               // hanya kode di dalam aplikasi
+        for (int pass = 0; pass < 2; pass++) {
+            Class k = pass ? object_getClass(c) : c;              // pass 1 = class method
+            Method m = class_getInstanceMethod(k, sel);
+            if (!m) continue;
+            Class sup = class_getSuperclass(k);
+            if (sup && class_getInstanceMethod(sup, sel) == m) continue;   // warisan, bukan milik k
+            if (method_getNumberOfArguments(m) != 2) continue;
+            char *rt = method_copyReturnType(m);
+            BOOL boolish = rt && (rt[0] == 'B' || rt[0] == 'c');
+            free(rt);
+            if (!boolish || method_getImplementation(m) == (IMP)na9_yes) continue;
+            method_setImplementation(m, (IMP)na9_yes);
+            NSLog(@"[NA9AgeSuffix] timestamp flag: %s%s", pass ? "+" : "-", class_getName(c));
+        }
+    }
+    free(list);
+}
+
+static void NA9StartTimestampPatch(void) {
+    // Ditunda supaya tidak memperlambat peluncuran; diulang sekali untuk class yang dimuat belakangan.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NA9PatchTimestampFlag(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NA9PatchTimestampFlag(); });
+}
+#else
+static void NA9StartTimestampPatch(void) {}
+#endif
 
 __attribute__((constructor)) static void NA9AgeInit(void) {
     @autoreleasepool {
@@ -273,5 +436,7 @@ __attribute__((constructor)) static void NA9AgeInit(void) {
         // Kait utama: coba sekarang, dan setiap kali ada image baru dimuat (NA9 bisa dimuat belakangan).
         NA9TryHookMain();
         _dyld_register_func_for_add_image(NA9ImageAdded);
+        NA9TimerStart();
+        NA9StartTimestampPatch();
     }
 }
