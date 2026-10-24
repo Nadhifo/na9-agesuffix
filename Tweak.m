@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.5
+// NA9AgeSuffix v1.6
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -211,9 +211,10 @@ static BOOL NA9LabelIsTarget(UIView *v) {
 #if NA9_HIDE_SEARCH_SUGGESTIONS
 static __weak UIView *gSugList = nil;
 static BOOL gSugDiagShown = NO;
+static int gNodeBudget = 0;                 // batas jumlah view yang diperiksa per putaran
 
 static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
-    if (depth > 70 || v.hidden || v.alpha < 0.01) return nil;
+    if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
     if (NA9LabelIsTarget(v)) return (UILabel *)v;
     for (UIView *sv in v.subviews) {
         UILabel *r = NA9FindTargetLabel(sv, depth + 1);
@@ -223,7 +224,7 @@ static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
 }
 
 static BOOL NA9ContainsTarget(UIView *v, int depth) {          // tanpa memeriksa hidden
-    if (depth > 70) return NO;
+    if (depth > 70 || gNodeBudget-- <= 0) return NO;
     if (NA9LabelIsTarget(v)) return YES;
     for (UIView *sv in v.subviews) if (NA9ContainsTarget(sv, depth + 1)) return YES;
     return NO;
@@ -240,12 +241,15 @@ static UIView *NA9ListFor(UIView *label) {
 }
 
 static void NA9HideTick(void) {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    gNodeBudget = 6000;
     UIView *list = gSugList;
     if (list) {
         if (list.window && NA9ContainsTarget(list, 0)) { if (!list.hidden) list.hidden = YES; return; }
         list.hidden = NO;                                         // isi berganti / halaman ditutup
         gSugList = nil;
     }
+    gNodeBudget = 6000;
     UILabel *hit = nil;
     for (UIWindow *w in NA9AllWindows()) { hit = NA9FindTargetLabel(w, 0); if (hit) break; }
     if (!hit) return;
@@ -330,7 +334,7 @@ static void NA9ProbeTick(void) {}
 
 static void NA9TimerStart(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) {
+        [NSTimer scheduledTimerWithTimeInterval:0.7 repeats:YES block:^(NSTimer *t) {
             NA9HideTick();
             NA9ProbeTick();
         }];
@@ -364,16 +368,29 @@ static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
 #if NA9_FEED_TIMESTAMPS
 static BOOL na9_yes(id self, SEL _cmd) { return YES; }
 
+// Hanya class di executable utama yang namanya berkaitan dengan tampilan feed/penulis/waktu yang diperiksa.
+// (Memindai SEMUA class memaksa runtime merealisasi puluhan ribu class: lambat dan boros memori.)
+static BOOL NA9NameLooksRelevant(const char *nm) {
+    static const char *keys[] = { "TimeStamp", "Timestamp", "Author", "UserName", "Nickname",
+                                  "Interaction", "Description", "FeedCell", "PostTime", "CreateTime" };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+        if (strcasestr(nm, keys[i])) return YES;
+    return NO;
+}
+
 static void NA9PatchTimestampFlag(void) {
     SEL sel = NSSelectorFromString(@"shouldShowTimeStampLabel");
+    const char *exe = [[NSBundle mainBundle] executablePath].fileSystemRepresentation;
+    if (!exe) return;
     unsigned int n = 0;
-    Class *list = objc_copyClassList(&n);
+    const char **names = objc_copyClassNamesForImage(exe, &n);       // hanya nama, tanpa merealisasi class
+    if (!names) return;
     for (unsigned int i = 0; i < n; i++) {
-        Class c = list[i];
-        const char *img = class_getImageName(c);
-        if (!img || !strstr(img, ".app/")) continue;               // hanya kode di dalam aplikasi
+        if (!NA9NameLooksRelevant(names[i])) continue;
+        Class c = objc_getClass(names[i]);
+        if (!c) continue;
         for (int pass = 0; pass < 2; pass++) {
-            Class k = pass ? object_getClass(c) : c;              // pass 1 = class method
+            Class k = pass ? object_getClass(c) : c;                  // pass 1 = class method
             Method m = class_getInstanceMethod(k, sel);
             if (!m) continue;
             Class sup = class_getSuperclass(k);
@@ -384,17 +401,17 @@ static void NA9PatchTimestampFlag(void) {
             free(rt);
             if (!boolish || method_getImplementation(m) == (IMP)na9_yes) continue;
             method_setImplementation(m, (IMP)na9_yes);
-            NSLog(@"[NA9AgeSuffix] timestamp flag: %s%s", pass ? "+" : "-", class_getName(c));
+            NSLog(@"[NA9AgeSuffix] timestamp flag: %s%s", pass ? "+" : "-", names[i]);
         }
     }
-    free(list);
+    free(names);
 }
 
 static void NA9StartTimestampPatch(void) {
     // Ditunda supaya tidak memperlambat peluncuran; diulang sekali untuk class yang dimuat belakangan.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NA9PatchTimestampFlag(); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NA9PatchTimestampFlag(); });
 }
 #else
