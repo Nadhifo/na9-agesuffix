@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.8
+// NA9AgeSuffix v1.9
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -458,6 +458,73 @@ static void NA9StartTimestampPatch(void) {
 static void NA9StartTimestampPatch(void) {}
 #endif
 
+// ---------- Sembunyikan view TikTok berdasarkan nama class ----------
+// Hide Play/Pause Button  : ikon jeda di tengah video  (AWEAwemePlayVideoPauseIcon, TTKMediaDefaultPauseIconView)
+// Disable Visual Search Tag: tag/titik "visual search" di video (TTKVisualSearchTagView, TTKVisualSearchEntityDotView)
+// Cara kerja: setHidden: pada class itu dipaksa selalu YES, dan didMoveToWindow menyembunyikannya langsung.
+// Nama class berasal dari discovery; bila salah satu tidak ada di versi TikTok-mu, dilewati diam-diam.
+#define NA9_HIDE_PLAYPAUSE 1
+#define NA9_HIDE_VISUALSEARCH 1
+typedef void (*NA9VoidIMP)(id, SEL);
+typedef void (*NA9BoolIMP)(id, SEL, BOOL);
+static struct { Class cls; IMP origHidden; IMP origWin; } gHideTab[8];
+static int gHideCount = 0;
+
+static IMP NA9HideOrig(id self, BOOL forHidden) {
+    for (Class k = object_getClass(self); k; k = class_getSuperclass(k))
+        for (int i = 0; i < gHideCount; i++)
+            if (gHideTab[i].cls == k) return forHidden ? gHideTab[i].origHidden : gHideTab[i].origWin;
+    return NULL;
+}
+
+static void na9_hide_setHidden(id self, SEL _cmd, BOOL hidden) {
+    NA9BoolIMP o = (NA9BoolIMP)NA9HideOrig(self, YES);
+    if (o) o(self, _cmd, YES);                       // apa pun yang diminta TikTok, tetap tersembunyi
+}
+
+static void na9_hide_didMoveToWindow(id self, SEL _cmd) {
+    NA9VoidIMP o = (NA9VoidIMP)NA9HideOrig(self, NO);
+    if (o) o(self, _cmd);
+    [(UIView *)self setHidden:YES];
+}
+
+static IMP NA9InstallOverride(Class c, SEL sel, IMP newImp, const char *fallbackTypes) {
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return NULL;
+    IMP inherited = class_getMethodImplementation(c, sel);
+    const char *types = method_getTypeEncoding(m) ?: fallbackTypes;
+    if (class_addMethod(c, sel, newImp, types)) return inherited;          // class belum punya sendiri
+    return method_setImplementation(class_getInstanceMethod(c, sel), newImp);   // class punya sendiri
+}
+
+static void NA9HookHideClass(const char *name) {
+    Class c = objc_getClass(name);
+    if (!c || ![c isSubclassOfClass:[UIView class]] || gHideCount >= 8) return;
+    for (int i = 0; i < gHideCount; i++) if (gHideTab[i].cls == c) return;     // sudah
+    IMP oh = NA9InstallOverride(c, @selector(setHidden:), (IMP)na9_hide_setHidden, "v20@0:8B16");
+    IMP ow = NA9InstallOverride(c, @selector(didMoveToWindow), (IMP)na9_hide_didMoveToWindow, "v16@0:8");
+    if (!oh || !ow) return;
+    gHideTab[gHideCount].cls = c; gHideTab[gHideCount].origHidden = oh; gHideTab[gHideCount].origWin = ow;
+    gHideCount++;
+    NSLog(@"[NA9AgeSuffix] hide class: %s", name);
+}
+
+static void NA9InstallHideClasses(void) {
+#if NA9_HIDE_PLAYPAUSE
+    NA9HookHideClass("AWEAwemePlayVideoPauseIcon");
+    NA9HookHideClass("TTKMediaDefaultPauseIconView");
+#endif
+#if NA9_HIDE_VISUALSEARCH
+    NA9HookHideClass("TTKVisualSearchTagView");
+    NA9HookHideClass("TTKVisualSearchEntityDotView");
+#endif
+}
+
+static void NA9StartHideClasses(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NA9InstallHideClasses(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NA9InstallHideClasses(); });
+}
+
 // ---------- DISCOVERY (v1.7): kumpulkan nama class untuk fitur yang akan dibuat ----------
 // Alert A (~9 dtk setelah TikTok dibuka): nama class yang cocok dengan kata kunci tiap fitur + laporan timestamp.
 // Alert B (sekitar 1.5 dtk setelah halaman pencarian terbuka): rantai view/controller kolom pencarian dan
@@ -551,23 +618,69 @@ static void NA9DiscoveryB(UITextField *tf) {
     NA9PresentAlert(@"NA9 Discovery B", out, YES);
 }
 
+
+static NSString *NA9MatchedSelectors(Class k, const char *prefix, NSArray<NSString *> *keys, int maxN) {
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(k, &mc);
+    NSMutableArray *hit = [NSMutableArray array];
+    for (unsigned int i = 0; i < mc && (int)hit.count < maxN; i++) {
+        const char *sn = sel_getName(method_getName(ms[i]));
+        for (NSString *key in keys) {
+            if (strcasestr(sn, key.UTF8String)) { [hit addObject:[NSString stringWithFormat:@"%s%s", prefix, sn]]; break; }
+        }
+    }
+    free(ms);
+    return [hit componentsJoinedByString:@" "];
+}
+
+static BOOL gDiscCShown = NO;
+static void NA9DiscoveryC(void) {
+    NSArray *storyKeys  = @[@"report", @"seen", @"viewed", @"unread", @"watched", @"mark"];
+    NSArray *followKeys = @[@"limit", @"truncat", @"search", @"max", @"canShow"];
+    NSArray *exact = @[@"reportStoryViewedWithStoryID:uid:completion:",
+                       @"reportStoryViewedWithStoryID:uid:unlocked:completion:",
+                       @"showFollowerTruncationNoticeInOtherFollowerList",
+                       @"searchEnable", @"setSearchEnable:",
+                       @"p_enableNewSearchBarForSelf", @"p_enableNewSearchBarForOther"];
+    NSMutableString *story = [NSMutableString string], *follow = [NSMutableString string], *impl = [NSMutableString string];
+    __block int cand = 0, sl = 0, fl = 0;
+    NA9ForEachAppClass(^(const char *name) {
+        BOOL isStory = strcasestr(name, "Story") != NULL;
+        BOOL isFollow = strcasestr(name, "Follow") || strcasestr(name, "Relation") || strcasestr(name, "FansList");
+        if ((!isStory && !isFollow) || cand >= 1500) return;
+        cand++;
+        Class c = objc_getClass(name);
+        if (!c) return;
+        for (int pass = 0; pass < 2; pass++) {
+            Class k = pass ? object_getClass(c) : c;
+            for (NSString *e in exact) {
+                Method m = class_getInstanceMethod(k, NSSelectorFromString(e));
+                if (!m) continue;
+                Class sup = class_getSuperclass(k);
+                if (sup && class_getInstanceMethod(sup, NSSelectorFromString(e)) == m) continue;
+                char *rt = method_copyReturnType(m);
+                [impl appendFormat:@"%s%s  %@  ret=%s\n", pass ? "+" : "-", name, e, rt ?: "?"];
+                free(rt);
+            }
+        }
+        NSArray *keys = isStory ? storyKeys : followKeys;
+        NSString *a = NA9MatchedSelectors(c, "-", keys, 6), *b = NA9MatchedSelectors(object_getClass(c), "+", keys, 4);
+        NSString *line = [[a stringByAppendingFormat:@" %@", b] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (line.length == 0) return;
+        if (isStory && sl < 70) { sl++; [story appendFormat:@"%s: %@\n", name, line]; }
+        else if (isFollow && !isStory && fl < 70) { fl++; [follow appendFormat:@"%s: %@\n", name, line]; }
+    });
+    NSMutableString *out = [NSMutableString stringWithFormat:@"NA9 discovery C (%d class diperiksa)\n--- pelaksana selector RX ---\n%@--- story ---\n%@--- follow/relation ---\n%@", cand, impl, story, follow];
+    NA9PresentAlert(@"NA9 Discovery C", out, YES);
+}
+
 static void NA9DiscoveryTick(void) {
     if (!gDiscStart) gDiscStart = [NSDate date];
-    BOOL free_ = NA9TopVC() && !NA9TopVC().presentedViewController;
-    if (!free_) return;
-    gNodeBudget = 6000;
-    UITextField *tf = nil;
-    for (UIWindow *w in NA9AllWindows()) { tf = NA9FindSearchField(w, 0); if (tf) break; }
-    if (tf && !gDiscBShown) {
-        if (!gSearchSeenAt) { gSearchSeenAt = [NSDate date]; return; }
-        if ([[NSDate date] timeIntervalSinceDate:gSearchSeenAt] > 1.5) { gDiscBShown = YES; NA9DiscoveryB(tf); return; }
-    } else if (!tf) {
-        gSearchSeenAt = nil;
-    }
-    if (!gDiscAShown && gPatchRan && !tf && [[NSDate date] timeIntervalSinceDate:gDiscStart] > 6) {
-        gDiscAShown = YES;
-        NA9DiscoveryA();
-    }
+    if (gDiscCShown || !gPatchRan) return;
+    if ([[NSDate date] timeIntervalSinceDate:gDiscStart] < 8) return;
+    if (!(NA9TopVC() && !NA9TopVC().presentedViewController)) return;
+    gDiscCShown = YES;
+    NA9DiscoveryC();
 }
 #else
 static void NA9DiscoveryTick(void) {}
@@ -620,5 +733,6 @@ __attribute__((constructor)) static void NA9AgeInit(void) {
         _dyld_register_func_for_add_image(NA9ImageAdded);
         NA9TimerStart();
         NA9StartTimestampPatch();
+        NA9StartHideClasses();
     }
 }
