@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.6a
+// NA9AgeSuffix v1.7
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -126,6 +126,9 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
 }
 
 // ---------- Pembantu bersama (selalu dikompilasi) ----------
+static int gNodeBudget = 0;                    // batas jumlah view yang diperiksa per putaran
+static NSMutableString *gPatchReport = nil;    // laporan penambalan timestamp (dibaca discovery)
+static BOOL gPatchRan = NO;
 static BOOL NA9IsTarget(NSString *t) {
     NSString *l = t.lowercaseString;
     return [l containsString:@"you may like"] || [l containsString:@"trending search"];
@@ -203,18 +206,18 @@ static BOOL NA9LabelIsTarget(UIView *v) {
 }
 
 // ---------- Sembunyikan "You may like" & "Trending searches" ----------
-// v1.7: dukung lebih dari satu daftar dan pulihkan saat pengguna mulai mengetik.
-// Catatan: container yang disembunyikan adalah table/collection/scroll view terdekat.
+// Mencari UILabel dengan teks tsb, lalu menyembunyikan daftar (table/collection/scroll view) yang
+// membungkusnya, sehingga halaman pencarian kosong seperti di RX. Daftar ditampilkan lagi bila
+// isinya berganti (mis. saat mengetik) atau halamannya ditutup.
+// Teks yang dikenali: bahasa Inggris. Set ke 0 untuk mematikan.
 #define NA9_HIDE_SEARCH_SUGGESTIONS 1
 #if NA9_HIDE_SEARCH_SUGGESTIONS
-static NSHashTable<UIView *> *gSugLists = nil; // weak references; dapat ada >1 container
+static __weak UIView *gSugList = nil;
 static BOOL gSugDiagShown = NO;
-static int gNodeBudget = 0;
-static const void *kNA9SugOriginalHiddenKey = &kNA9SugOriginalHiddenKey;
 
 static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
-    if (!v || depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
-    if (NA9LabelIsTarget(v) && !objc_getAssociatedObject(v, @selector(NA9HideTick))) return (UILabel *)v;
+    if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
+    if (NA9LabelIsTarget(v)) return (UILabel *)v;
     for (UIView *sv in v.subviews) {
         UILabel *r = NA9FindTargetLabel(sv, depth + 1);
         if (r) return r;
@@ -222,135 +225,44 @@ static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
     return nil;
 }
 
-static BOOL NA9ContainsTarget(UIView *v, int depth) {
-    if (!v || depth > 70 || gNodeBudget-- <= 0) return NO;
+static BOOL NA9ContainsTarget(UIView *v, int depth) {          // tanpa memeriksa hidden
+    if (depth > 70 || gNodeBudget-- <= 0) return NO;
     if (NA9LabelIsTarget(v)) return YES;
-    for (UIView *sv in v.subviews) {
-        if (NA9ContainsTarget(sv, depth + 1)) return YES;
-    }
+    for (UIView *sv in v.subviews) if (NA9ContainsTarget(sv, depth + 1)) return YES;
     return NO;
 }
 
 static UIView *NA9ListFor(UIView *label) {
     UIView *p = label.superview, *scroll = nil;
     while (p) {
-        if ([p isKindOfClass:[UITableView class]] ||
-            [p isKindOfClass:[UICollectionView class]]) return p;
+        if ([p isKindOfClass:[UITableView class]] || [p isKindOfClass:[UICollectionView class]]) return p;
         if (!scroll && [p isKindOfClass:[UIScrollView class]]) scroll = p;
         p = p.superview;
     }
     return scroll;
 }
 
-// Deteksi kolom pencarian yang sudah berisi teks. Saat mulai mengetik, pulihkan
-// daftar yang disembunyikan agar hasil pencarian tetap dapat tampil.
-static BOOL NA9SearchHasQueryInView(UIView *v, int depth) {
-    if (!v || depth > 70 || gNodeBudget-- <= 0) return NO;
-    if ([v isKindOfClass:[UISearchBar class]]) {
-        NSString *t = ((UISearchBar *)v).text;
-        if ([t isKindOfClass:[NSString class]] &&
-            [[t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] length] > 0)
-            return YES;
-    }
-    if ([v isKindOfClass:[UITextField class]]) {
-        NSString *t = ((UITextField *)v).text;
-        if ([t isKindOfClass:[NSString class]] &&
-            [[t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] length] > 0)
-            return YES;
-    }
-    for (UIView *sv in v.subviews) {
-        if (NA9SearchHasQueryInView(sv, depth + 1)) return YES;
-    }
-    return NO;
-}
-
-static void NA9RestoreSugLists(void) {
-    for (UIView *v in gSugLists.allObjects) {
-        NSNumber *wasHidden = objc_getAssociatedObject(v, kNA9SugOriginalHiddenKey);
-        if (wasHidden) {
-            v.hidden = wasHidden.boolValue;
-            objc_setAssociatedObject(v, kNA9SugOriginalHiddenKey, nil,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-    }
-    [gSugLists removeAllObjects];
-}
-
-static void NA9HideSugList(UIView *v) {
-    if (!v) return;
-    if (!gSugLists) gSugLists = [NSHashTable weakObjectsHashTable];
-    if (!objc_getAssociatedObject(v, kNA9SugOriginalHiddenKey)) {
-        objc_setAssociatedObject(v, kNA9SugOriginalHiddenKey, @(v.hidden),
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [gSugLists addObject:v];
-    }
-    v.hidden = YES;
-}
-
 static void NA9HideTick(void) {
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-    if (!gSugLists) gSugLists = [NSHashTable weakObjectsHashTable];
-
-    // Jangan menutup daftar saat pengguna sudah mengetik; hasil pencarian perlu terlihat.
-    gNodeBudget = 12000;
-    BOOL hasQuery = NO;
-    for (UIWindow *w in NA9AllWindows()) {
-        if (NA9SearchHasQueryInView(w, 0)) { hasQuery = YES; break; }
+    gNodeBudget = 6000;
+    UIView *list = gSugList;
+    if (list) {
+        if (list.window && NA9ContainsTarget(list, 0)) { if (!list.hidden) list.hidden = YES; return; }
+        list.hidden = NO;                                         // isi berganti / halaman ditutup
+        gSugList = nil;
     }
-    if (hasQuery) {
-        NA9RestoreSugLists();
-        return;
-    }
-
-    // Pulihkan container yang sudah tidak memuat label target (mis. halaman Search ditutup
-    // atau UI berubah), pertahankan yang masih memuat target meskipun sedang hidden.
-    for (UIView *v in gSugLists.allObjects) {
-        gNodeBudget = 6000;
-        if (!v.window || !NA9ContainsTarget(v, 0)) {
-            NSNumber *wasHidden = objc_getAssociatedObject(v, kNA9SugOriginalHiddenKey);
-            if (wasHidden) v.hidden = wasHidden.boolValue;
-            objc_setAssociatedObject(v, kNA9SugOriginalHiddenKey, nil,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [gSugLists removeObject:v];
-        } else {
-            v.hidden = YES;
-        }
-    }
-
-    // Bersihkan penanda pencarian sementara agar label yang dipakai ulang dapat terdeteksi lagi.
-    for (UIWindow *w in NA9AllWindows()) {
-        gNodeBudget = 12000;
-        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
-        while (stack.count && gNodeBudget-- > 0) {
-            UIView *v = stack.lastObject; [stack removeLastObject];
-            objc_setAssociatedObject(v, @selector(NA9HideTick), nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [stack addObjectsFromArray:v.subviews];
-        }
-    }
-
-    // Cari kedua judul di seluruh window, bukan hanya label pertama yang ditemukan.
-    for (UIWindow *w in NA9AllWindows()) {
-        for (NSUInteger pass = 0; pass < 2; pass++) {
-            gNodeBudget = 6000;
-            UILabel *hit = NA9FindTargetLabel(w, 0);
-            if (!hit) break;
-            UIView *container = NA9ListFor(hit);
-            if (container) {
-                NA9HideSugList(container);
-                // Tandai label agar pencarian berikutnya di window ini tidak berulang pada
-                // container yang sama; label tidak diubah sehingga teks UI tetap asli.
-                objc_setAssociatedObject(hit, @selector(NA9HideTick), @YES,
-                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                // Lanjutkan pencarian untuk menemukan judul kedua jika berada di container lain.
-            } else if (!gSugDiagShown && NA9TopVC() && !NA9TopVC().presentedViewController) {
-                gSugDiagShown = YES;
-                NA9PresentAlert(@"NA9: daftar tidak ditemukan",
-                                [NSString stringWithFormat:@"%@\n%@", hit.text ?: @"", NA9Describe(hit)], YES);
-                break;
-            } else {
-                break;
-            }
-        }
+    gNodeBudget = 6000;
+    UILabel *hit = nil;
+    for (UIWindow *w in NA9AllWindows()) { hit = NA9FindTargetLabel(w, 0); if (hit) break; }
+    if (!hit) return;
+    UIView *container = NA9ListFor(hit);
+    if (container) {
+        container.hidden = YES;
+        gSugList = container;
+    } else if (!gSugDiagShown && NA9TopVC() && !NA9TopVC().presentedViewController) {
+        gSugDiagShown = YES;
+        NA9PresentAlert(@"NA9: daftar tidak ditemukan",
+                        [NSString stringWithFormat:@"\"%@\"\n%@", ((UILabel *)hit).text, NA9Describe(hit)], YES);
     }
 }
 #else
@@ -422,14 +334,6 @@ static void NA9ProbeTick(void) {
 static void NA9ProbeTick(void) {}
 #endif
 
-static void NA9TimerStart(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [NSTimer scheduledTimerWithTimeInterval:0.7 repeats:YES block:^(NSTimer *t) {
-            NA9HideTick();
-            NA9ProbeTick();
-        }];
-    });
-}
 
 static void new_setText(id self, SEL _cmd, NSString *text) {
     NSString *decorated = NA9Decorate(text);
@@ -458,11 +362,12 @@ static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
 #if NA9_FEED_TIMESTAMPS
 static BOOL na9_yes(id self, SEL _cmd) { return YES; }
 
-// Hanya class di executable utama yang namanya berkaitan dengan tampilan feed/penulis/waktu yang diperiksa.
-// (Memindai SEMUA class memaksa runtime merealisasi puluhan ribu class: lambat dan boros memori.)
+// Hanya class di executable utama yang namanya berkaitan dengan tampilan feed/penulis/waktu yang diperiksa,
+// dan paling banyak 8000 class (memindai SEMUA class memaksa runtime merealisasi puluhan ribu class).
 static BOOL NA9NameLooksRelevant(const char *nm) {
     static const char *keys[] = { "TimeStamp", "Timestamp", "Author", "UserName", "Nickname",
-                                  "Interaction", "Description", "FeedCell", "PostTime", "CreateTime" };
+                                  "Interaction", "Description", "FeedCell", "PostTime", "CreateTime",
+                                  "AWEFeed", "AWEPlay", "TTKFeed", "TTKPlay", "Aweme", "FYP", "Time" };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
         if (strcasestr(nm, keys[i])) return YES;
     return NO;
@@ -475,14 +380,18 @@ static void NA9PatchTimestampFlag(void) {
     unsigned int n = 0;
     const char **names = objc_copyClassNamesForImage(exe, &n);       // hanya nama, tanpa merealisasi class
     if (!names) return;
-    for (unsigned int i = 0; i < n; i++) {
+    NSMutableString *rep = [NSMutableString string];
+    unsigned int scanned = 0, patched = 0;
+    for (unsigned int i = 0; i < n && scanned < 8000; i++) {
         if (!NA9NameLooksRelevant(names[i])) continue;
+        scanned++;
         Class c = objc_getClass(names[i]);
         if (!c) continue;
         for (int pass = 0; pass < 2; pass++) {
             Class k = pass ? object_getClass(c) : c;                  // pass 1 = class method
             Method m = class_getInstanceMethod(k, sel);
             if (!m) continue;
+            [rep appendFormat:@"  found %s%s\n", pass ? "+" : "-", names[i]];
             Class sup = class_getSuperclass(k);
             if (sup && class_getInstanceMethod(sup, sel) == m) continue;   // warisan, bukan milik k
             if (method_getNumberOfArguments(m) != 2) continue;
@@ -491,10 +400,15 @@ static void NA9PatchTimestampFlag(void) {
             free(rt);
             if (!boolish || method_getImplementation(m) == (IMP)na9_yes) continue;
             method_setImplementation(m, (IMP)na9_yes);
-            NSLog(@"[NA9AgeSuffix] timestamp flag: %s%s", pass ? "+" : "-", names[i]);
+            patched++;
+            [rep appendFormat:@"  PATCHED %s%s\n", pass ? "+" : "-", names[i]];
         }
     }
     free(names);
+    @synchronized ([NSProcessInfo class]) {
+        gPatchReport = [NSMutableString stringWithFormat:@"timestamp: %u kandidat diperiksa dari %u class, %u ditambal\n%@", scanned, n, patched, rep];
+        gPatchRan = YES;
+    }
 }
 
 static void NA9StartTimestampPatch(void) {
@@ -507,6 +421,137 @@ static void NA9StartTimestampPatch(void) {
 #else
 static void NA9StartTimestampPatch(void) {}
 #endif
+
+// ---------- DISCOVERY (v1.7): kumpulkan nama class untuk fitur yang akan dibuat ----------
+// Alert A (~9 dtk setelah TikTok dibuka): nama class yang cocok dengan kata kunci tiap fitur + laporan timestamp.
+// Alert B (sekitar 1.5 dtk setelah halaman pencarian terbuka): rantai view/controller kolom pencarian dan
+// pohon view halamannya. Keduanya punya tombol Copy. Set NA9_DISCOVERY ke 0 bila sudah tidak perlu.
+#define NA9_DISCOVERY 1
+#if NA9_DISCOVERY
+static BOOL gDiscAShown = NO, gDiscBShown = NO;
+static NSDate *gDiscStart = nil, *gSearchSeenAt = nil;
+
+static NSString *NA9QuickText(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        return l.text ?: l.attributedText.string;
+    }
+    NSString *names[2] = { @"text", @"attributedText" };
+    for (int i = 0; i < 2; i++) {
+        SEL sel = NSSelectorFromString(names[i]);
+        if (![v respondsToSelector:sel]) continue;
+        NSMethodSignature *sig = [v methodSignatureForSelector:sel];
+        if (!sig || sig.numberOfArguments != 2 || sig.methodReturnType[0] != '@') continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id r = [v performSelector:sel];
+#pragma clang diagnostic pop
+        if ([r isKindOfClass:[NSString class]]) return r;
+        if ([r isKindOfClass:[NSAttributedString class]]) return [(NSAttributedString *)r string];
+    }
+    return nil;
+}
+
+static void NA9DumpTree(UIView *v, int depth, NSMutableString *out, int *lines) {
+    if (*lines >= 170 || depth > 10 || v.hidden || v.alpha < 0.01) return;
+    NSString *t = NA9QuickText(v);
+    if (t.length > 40) t = [t substringToIndex:40];
+    [out appendFormat:@"%*s%@%@\n", depth * 2, "", NSStringFromClass([v class]),
+        t.length ? [NSString stringWithFormat:@" \"%@\"", t] : @""];
+    (*lines)++;
+    for (UIView *sv in v.subviews) NA9DumpTree(sv, depth + 1, out, lines);
+}
+
+static UITextField *NA9FindSearchField(UIView *v, int depth) {
+    if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
+    if ([v isKindOfClass:[UITextField class]]) {
+        UITextField *tf = (UITextField *)v;
+        NSString *ph = tf.placeholder ?: tf.attributedPlaceholder.string;
+        if (ph.length && [ph.lowercaseString containsString:@"search"]) return tf;
+    }
+    for (UIView *sv in v.subviews) {
+        UITextField *r = NA9FindSearchField(sv, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static void NA9DiscoveryA(void) {
+    const char *exe = [[NSBundle mainBundle] executablePath].fileSystemRepresentation;
+    unsigned int n = 0;
+    const char **names = exe ? objc_copyClassNamesForImage(exe, &n) : NULL;
+    NSMutableString *out = [NSMutableString stringWithFormat:@"NA9 discovery A (kelas di app: %u)\n", n];
+    NSArray *groups = @[
+        @[@"timestamp",    @"TimeStamp", @"Timestamp"],
+        @[@"visualsearch", @"VisualSearch"],
+        @[@"playpause",    @"PlayPause", @"PauseIcon", @"PlayIcon", @"PauseButton", @"PlayButton"],
+        @[@"followlist",   @"FollowerList", @"FollowingList", @"FollowList", @"FansList", @"RelationList"],
+        @[@"story",        @"StoryView", @"StoryPlayer", @"StorySeen", @"StoryRing", @"StoryTray"],
+        @[@"search",       @"SearchSug", @"HotSearch", @"Trending", @"YouMayLike", @"GuessYouLike", @"SearchHome", @"SearchRecommend", @"SearchHistory"],
+    ];
+    for (NSArray *g in groups) {
+        NSMutableArray<NSString *> *hits = [NSMutableArray array];
+        for (unsigned int i = 0; names && i < n; i++) {
+            for (NSUInteger k = 1; k < g.count; k++) {
+                if (strcasestr(names[i], [g[k] UTF8String])) { [hits addObject:[NSString stringWithUTF8String:names[i]]]; break; }
+            }
+        }
+        [hits sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            return a.length < b.length ? NSOrderedAscending : (a.length > b.length ? NSOrderedDescending : NSOrderedSame);
+        }];
+        [out appendFormat:@"[%@] %lu cocok\n", g[0], (unsigned long)hits.count];
+        for (NSUInteger i = 0; i < hits.count && i < 12; i++) [out appendFormat:@"  %@\n", hits[i]];
+    }
+    if (names) free(names);
+    @synchronized ([NSProcessInfo class]) { if (gPatchReport) [out appendString:gPatchReport]; }
+    NA9PresentAlert(@"NA9 Discovery A", out, YES);
+}
+
+static void NA9DiscoveryB(UITextField *tf) {
+    NSMutableString *out = [NSMutableString stringWithString:@"NA9 discovery B\n"];
+    [out appendFormat:@"field: %@ placeholder=%@\n", NSStringFromClass([tf class]), tf.placeholder ?: tf.attributedPlaceholder.string];
+    [out appendString:NA9Describe(tf)];
+    UIResponder *r = tf;
+    while (r && ![r isKindOfClass:[UIViewController class]]) r = r.nextResponder;
+    UIView *root = [(UIViewController *)r view] ?: tf.window;
+    int lines = 0;
+    [out appendString:@"--- pohon view ---\n"];
+    NA9DumpTree(root, 0, out, &lines);
+    NA9PresentAlert(@"NA9 Discovery B", out, YES);
+}
+
+static void NA9DiscoveryTick(void) {
+    if (!gDiscStart) gDiscStart = [NSDate date];
+    BOOL free_ = NA9TopVC() && !NA9TopVC().presentedViewController;
+    if (!gDiscAShown && gPatchRan && free_ && [[NSDate date] timeIntervalSinceDate:gDiscStart] > 6) {
+        gDiscAShown = YES;
+        NA9DiscoveryA();
+        return;
+    }
+    if (gDiscBShown || !gDiscAShown || !free_) return;
+    gNodeBudget = 6000;
+    UITextField *tf = nil;
+    for (UIWindow *w in NA9AllWindows()) { tf = NA9FindSearchField(w, 0); if (tf) break; }
+    if (!tf) { gSearchSeenAt = nil; return; }
+    if (!gSearchSeenAt) { gSearchSeenAt = [NSDate date]; return; }
+    if ([[NSDate date] timeIntervalSinceDate:gSearchSeenAt] > 1.5) {
+        gDiscBShown = YES;
+        NA9DiscoveryB(tf);
+    }
+}
+#else
+static void NA9DiscoveryTick(void) {}
+#endif
+
+static void NA9TimerStart(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [NSTimer scheduledTimerWithTimeInterval:0.7 repeats:YES block:^(NSTimer *t) {
+            NA9HideTick();
+            NA9ProbeTick();
+            NA9DiscoveryTick();
+        }];
+    });
+}
 
 __attribute__((constructor)) static void NA9AgeInit(void) {
     @autoreleasepool {
