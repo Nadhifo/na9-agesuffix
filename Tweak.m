@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.7
+// NA9AgeSuffix v1.8
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -143,6 +143,41 @@ static NSArray<UIWindow *> *NA9AllWindows(void) {
     return ws;
 }
 
+static NSString *NA9QuickText(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        return l.text ?: l.attributedText.string;
+    }
+    NSString *names[2] = { @"text", @"attributedText" };
+    for (int i = 0; i < 2; i++) {
+        SEL sel = NSSelectorFromString(names[i]);
+        if (![v respondsToSelector:sel]) continue;
+        NSMethodSignature *sig = [v methodSignatureForSelector:sel];
+        if (!sig || sig.numberOfArguments != 2 || sig.methodReturnType[0] != '@') continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id r = [v performSelector:sel];
+#pragma clang diagnostic pop
+        if ([r isKindOfClass:[NSString class]]) return r;
+        if ([r isKindOfClass:[NSAttributedString class]]) return [(NSAttributedString *)r string];
+    }
+    return nil;
+}
+
+// Iterasi nama semua class ObjC di image milik aplikasi (path dari dyld, tanpa merealisasi class).
+static void NA9ForEachAppClass(void (^cb)(const char *name)) {
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *p = _dyld_get_image_name(i);
+        if (!p || !strstr(p, ".app/")) continue;
+        unsigned int n = 0;
+        const char **names = objc_copyClassNamesForImage(p, &n);
+        if (!names) continue;
+        for (unsigned int j = 0; j < n; j++) cb(names[j]);
+        free(names);
+    }
+}
+
 static UIViewController *NA9TopVC(void) {
     UIWindow *win = nil;
     for (UIWindow *w in NA9AllWindows()) if (w.isKeyWindow) win = w;
@@ -199,9 +234,15 @@ static void NA9PresentAlert(NSString *title, NSString *msg, BOOL withCopy) {
 }
 
 static BOOL NA9LabelIsTarget(UIView *v) {
-    if (![v isKindOfClass:[UILabel class]]) return NO;
-    UILabel *l = (UILabel *)v;
-    NSString *t = l.text ?: l.attributedText.string;
+    NSString *t = nil;
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        t = l.text ?: l.attributedText.string;
+    } else {
+        const char *cn = class_getName(object_getClass(v));
+        if (!cn || !(strstr(cn, "Label") || strstr(cn, "Text"))) return NO;
+        t = NA9QuickText(v);
+    }
     return t.length > 0 && NA9IsTarget(t);
 }
 
@@ -215,11 +256,11 @@ static BOOL NA9LabelIsTarget(UIView *v) {
 static __weak UIView *gSugList = nil;
 static BOOL gSugDiagShown = NO;
 
-static UILabel *NA9FindTargetLabel(UIView *v, int depth) {
+static UIView *NA9FindTargetLabel(UIView *v, int depth) {
     if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
-    if (NA9LabelIsTarget(v)) return (UILabel *)v;
+    if (NA9LabelIsTarget(v)) return v;
     for (UIView *sv in v.subviews) {
-        UILabel *r = NA9FindTargetLabel(sv, depth + 1);
+        UIView *r = NA9FindTargetLabel(sv, depth + 1);
         if (r) return r;
     }
     return nil;
@@ -252,7 +293,7 @@ static void NA9HideTick(void) {
         gSugList = nil;
     }
     gNodeBudget = 6000;
-    UILabel *hit = nil;
+    UIView *hit = nil;
     for (UIWindow *w in NA9AllWindows()) { hit = NA9FindTargetLabel(w, 0); if (hit) break; }
     if (!hit) return;
     UIView *container = NA9ListFor(hit);
@@ -262,7 +303,7 @@ static void NA9HideTick(void) {
     } else if (!gSugDiagShown && NA9TopVC() && !NA9TopVC().presentedViewController) {
         gSugDiagShown = YES;
         NA9PresentAlert(@"NA9: daftar tidak ditemukan",
-                        [NSString stringWithFormat:@"\"%@\"\n%@", ((UILabel *)hit).text, NA9Describe(hit)], YES);
+                        [NSString stringWithFormat:@"\"%@\"\n%@", NA9QuickText(hit), NA9Describe(hit)], YES);
     }
 }
 #else
@@ -375,23 +416,19 @@ static BOOL NA9NameLooksRelevant(const char *nm) {
 
 static void NA9PatchTimestampFlag(void) {
     SEL sel = NSSelectorFromString(@"shouldShowTimeStampLabel");
-    const char *exe = [[NSBundle mainBundle] executablePath].fileSystemRepresentation;
-    if (!exe) return;
-    unsigned int n = 0;
-    const char **names = objc_copyClassNamesForImage(exe, &n);       // hanya nama, tanpa merealisasi class
-    if (!names) return;
+    __block unsigned int total = 0, scanned = 0, patched = 0;
     NSMutableString *rep = [NSMutableString string];
-    unsigned int scanned = 0, patched = 0;
-    for (unsigned int i = 0; i < n && scanned < 8000; i++) {
-        if (!NA9NameLooksRelevant(names[i])) continue;
+    NA9ForEachAppClass(^(const char *name) {
+        total++;
+        if (scanned >= 8000 || !NA9NameLooksRelevant(name)) return;
         scanned++;
-        Class c = objc_getClass(names[i]);
-        if (!c) continue;
+        Class c = objc_getClass(name);
+        if (!c) return;
         for (int pass = 0; pass < 2; pass++) {
             Class k = pass ? object_getClass(c) : c;                  // pass 1 = class method
             Method m = class_getInstanceMethod(k, sel);
             if (!m) continue;
-            [rep appendFormat:@"  found %s%s\n", pass ? "+" : "-", names[i]];
+            [rep appendFormat:@"  found %s%s\n", pass ? "+" : "-", name];
             Class sup = class_getSuperclass(k);
             if (sup && class_getInstanceMethod(sup, sel) == m) continue;   // warisan, bukan milik k
             if (method_getNumberOfArguments(m) != 2) continue;
@@ -401,12 +438,11 @@ static void NA9PatchTimestampFlag(void) {
             if (!boolish || method_getImplementation(m) == (IMP)na9_yes) continue;
             method_setImplementation(m, (IMP)na9_yes);
             patched++;
-            [rep appendFormat:@"  PATCHED %s%s\n", pass ? "+" : "-", names[i]];
+            [rep appendFormat:@"  PATCHED %s%s\n", pass ? "+" : "-", name];
         }
-    }
-    free(names);
+    });
     @synchronized ([NSProcessInfo class]) {
-        gPatchReport = [NSMutableString stringWithFormat:@"timestamp: %u kandidat diperiksa dari %u class, %u ditambal\n%@", scanned, n, patched, rep];
+        gPatchReport = [NSMutableString stringWithFormat:@"timestamp: %u kandidat diperiksa dari %u class, %u ditambal\n%@", scanned, total, patched, rep];
         gPatchRan = YES;
     }
 }
@@ -431,43 +467,32 @@ static void NA9StartTimestampPatch(void) {}
 static BOOL gDiscAShown = NO, gDiscBShown = NO;
 static NSDate *gDiscStart = nil, *gSearchSeenAt = nil;
 
-static NSString *NA9QuickText(UIView *v) {
-    if ([v isKindOfClass:[UILabel class]]) {
-        UILabel *l = (UILabel *)v;
-        return l.text ?: l.attributedText.string;
-    }
-    NSString *names[2] = { @"text", @"attributedText" };
-    for (int i = 0; i < 2; i++) {
-        SEL sel = NSSelectorFromString(names[i]);
-        if (![v respondsToSelector:sel]) continue;
-        NSMethodSignature *sig = [v methodSignatureForSelector:sel];
-        if (!sig || sig.numberOfArguments != 2 || sig.methodReturnType[0] != '@') continue;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        id r = [v performSelector:sel];
-#pragma clang diagnostic pop
-        if ([r isKindOfClass:[NSString class]]) return r;
-        if ([r isKindOfClass:[NSAttributedString class]]) return [(NSAttributedString *)r string];
-    }
-    return nil;
-}
-
 static void NA9DumpTree(UIView *v, int depth, NSMutableString *out, int *lines) {
-    if (*lines >= 170 || depth > 10 || v.hidden || v.alpha < 0.01) return;
+    if (*lines >= 260 || depth > 14 || v.hidden || v.alpha < 0.01) return;
     NSString *t = NA9QuickText(v);
     if (t.length > 40) t = [t substringToIndex:40];
     [out appendFormat:@"%*s%@%@\n", depth * 2, "", NSStringFromClass([v class]),
         t.length ? [NSString stringWithFormat:@" \"%@\"", t] : @""];
     (*lines)++;
-    for (UIView *sv in v.subviews) NA9DumpTree(sv, depth + 1, out, lines);
+    NSString *lastCls = nil; int same = 0, skipped = 0;
+    for (UIView *sv in v.subviews) {
+        NSString *cn = NSStringFromClass([sv class]);
+        if ([cn isEqualToString:lastCls]) { same++; if (same >= 3) { skipped++; continue; } }
+        else { if (skipped) { [out appendFormat:@"%*s... +%d %@ lain\n", (depth + 1) * 2, "", skipped, lastCls]; skipped = 0; } lastCls = cn; same = 0; }
+        NA9DumpTree(sv, depth + 1, out, lines);
+    }
+    if (skipped) [out appendFormat:@"%*s... +%d %@ lain\n", (depth + 1) * 2, "", skipped, lastCls];
 }
 
+// Kolom pencarian KOSONG milik AWESearchBar (= halaman awal pencarian: riwayat / You may like / Trending).
 static UITextField *NA9FindSearchField(UIView *v, int depth) {
     if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
-    if ([v isKindOfClass:[UITextField class]]) {
-        UITextField *tf = (UITextField *)v;
-        NSString *ph = tf.placeholder ?: tf.attributedPlaceholder.string;
-        if (ph.length && [ph.lowercaseString containsString:@"search"]) return tf;
+    if ([v isKindOfClass:[UITextField class]] && ((UITextField *)v).text.length == 0) {
+        UIView *p = v.superview;
+        for (int i = 0; p && i < 8; i++, p = p.superview) {
+            const char *cn = class_getName(object_getClass(p));
+            if (cn && strstr(cn, "SearchBar")) return (UITextField *)v;
+        }
     }
     for (UIView *sv in v.subviews) {
         UITextField *r = NA9FindSearchField(sv, depth + 1);
@@ -477,10 +502,6 @@ static UITextField *NA9FindSearchField(UIView *v, int depth) {
 }
 
 static void NA9DiscoveryA(void) {
-    const char *exe = [[NSBundle mainBundle] executablePath].fileSystemRepresentation;
-    unsigned int n = 0;
-    const char **names = exe ? objc_copyClassNamesForImage(exe, &n) : NULL;
-    NSMutableString *out = [NSMutableString stringWithFormat:@"NA9 discovery A (kelas di app: %u)\n", n];
     NSArray *groups = @[
         @[@"timestamp",    @"TimeStamp", @"Timestamp"],
         @[@"visualsearch", @"VisualSearch"],
@@ -489,26 +510,36 @@ static void NA9DiscoveryA(void) {
         @[@"story",        @"StoryView", @"StoryPlayer", @"StorySeen", @"StoryRing", @"StoryTray"],
         @[@"search",       @"SearchSug", @"HotSearch", @"Trending", @"YouMayLike", @"GuessYouLike", @"SearchHome", @"SearchRecommend", @"SearchHistory"],
     ];
-    for (NSArray *g in groups) {
-        NSMutableArray<NSString *> *hits = [NSMutableArray array];
-        for (unsigned int i = 0; names && i < n; i++) {
+    NSMutableArray<NSMutableArray<NSString *> *> *hits = [NSMutableArray array];
+    for (NSUInteger i = 0; i < groups.count; i++) [hits addObject:[NSMutableArray array]];
+    __block unsigned int total = 0;
+    NA9ForEachAppClass(^(const char *name) {
+        total++;
+        for (NSUInteger gi = 0; gi < groups.count; gi++) {
+            NSArray *g = groups[gi];
             for (NSUInteger k = 1; k < g.count; k++) {
-                if (strcasestr(names[i], [g[k] UTF8String])) { [hits addObject:[NSString stringWithUTF8String:names[i]]]; break; }
+                if (strcasestr(name, [g[k] UTF8String])) {
+                    if (hits[gi].count < 400) [hits[gi] addObject:[NSString stringWithUTF8String:name]];
+                    break;
+                }
             }
         }
-        [hits sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+    });
+    NSMutableString *out = [NSMutableString stringWithFormat:@"NA9 discovery A (kelas di app: %u)\n", total];
+    for (NSUInteger gi = 0; gi < groups.count; gi++) {
+        NSMutableArray<NSString *> *h = hits[gi];
+        [h sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
             return a.length < b.length ? NSOrderedAscending : (a.length > b.length ? NSOrderedDescending : NSOrderedSame);
         }];
-        [out appendFormat:@"[%@] %lu cocok\n", g[0], (unsigned long)hits.count];
-        for (NSUInteger i = 0; i < hits.count && i < 12; i++) [out appendFormat:@"  %@\n", hits[i]];
+        [out appendFormat:@"[%@] %lu cocok\n", groups[gi][0], (unsigned long)h.count];
+        for (NSUInteger i = 0; i < h.count && i < 12; i++) [out appendFormat:@"  %@\n", h[i]];
     }
-    if (names) free(names);
     @synchronized ([NSProcessInfo class]) { if (gPatchReport) [out appendString:gPatchReport]; }
     NA9PresentAlert(@"NA9 Discovery A", out, YES);
 }
 
 static void NA9DiscoveryB(UITextField *tf) {
-    NSMutableString *out = [NSMutableString stringWithString:@"NA9 discovery B\n"];
+    NSMutableString *out = [NSMutableString stringWithString:@"NA9 discovery B (halaman awal pencarian)\n"];
     [out appendFormat:@"field: %@ placeholder=%@\n", NSStringFromClass([tf class]), tf.placeholder ?: tf.attributedPlaceholder.string];
     [out appendString:NA9Describe(tf)];
     UIResponder *r = tf;
@@ -523,20 +554,19 @@ static void NA9DiscoveryB(UITextField *tf) {
 static void NA9DiscoveryTick(void) {
     if (!gDiscStart) gDiscStart = [NSDate date];
     BOOL free_ = NA9TopVC() && !NA9TopVC().presentedViewController;
-    if (!gDiscAShown && gPatchRan && free_ && [[NSDate date] timeIntervalSinceDate:gDiscStart] > 6) {
-        gDiscAShown = YES;
-        NA9DiscoveryA();
-        return;
-    }
-    if (gDiscBShown || !gDiscAShown || !free_) return;
+    if (!free_) return;
     gNodeBudget = 6000;
     UITextField *tf = nil;
     for (UIWindow *w in NA9AllWindows()) { tf = NA9FindSearchField(w, 0); if (tf) break; }
-    if (!tf) { gSearchSeenAt = nil; return; }
-    if (!gSearchSeenAt) { gSearchSeenAt = [NSDate date]; return; }
-    if ([[NSDate date] timeIntervalSinceDate:gSearchSeenAt] > 1.5) {
-        gDiscBShown = YES;
-        NA9DiscoveryB(tf);
+    if (tf && !gDiscBShown) {
+        if (!gSearchSeenAt) { gSearchSeenAt = [NSDate date]; return; }
+        if ([[NSDate date] timeIntervalSinceDate:gSearchSeenAt] > 1.5) { gDiscBShown = YES; NA9DiscoveryB(tf); return; }
+    } else if (!tf) {
+        gSearchSeenAt = nil;
+    }
+    if (!gDiscAShown && gPatchRan && !tf && [[NSDate date] timeIntervalSinceDate:gDiscStart] > 6) {
+        gDiscAShown = YES;
+        NA9DiscoveryA();
     }
 }
 #else
