@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.9
+// NA9AgeSuffix v2.0
 // Menambahkan umur postingan ("4h", "3d", ...) di belakang tanggal upload NA9 TikTok:
 //   22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
 //
@@ -14,6 +14,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+
+#define NA9_DISCOVERY 1   // alert diagnosis sementara (set 0 untuk mematikan semuanya)
 
 static NSRegularExpression *gRegex;
 static NSArray<NSDateFormatter *> *gFormatters;
@@ -178,12 +180,31 @@ static void NA9ForEachAppClass(void (^cb)(const char *name)) {
     }
 }
 
+static BOOL NA9SearchPageActive(void);   // didefinisikan setelah NA9TopVC
+
 static UIViewController *NA9TopVC(void) {
     UIWindow *win = nil;
     for (UIWindow *w in NA9AllWindows()) if (w.isKeyWindow) win = w;
     UIViewController *top = win.rootViewController;
     while (top.presentedViewController) top = top.presentedViewController;
     return top;
+}
+
+static BOOL NA9SearchPageActive(void) {
+    UIWindow *win = nil;
+    for (UIWindow *w in NA9AllWindows()) if (w.isKeyWindow) win = w;
+    UIViewController *vc = win.rootViewController;
+    for (int i = 0; i < 10 && vc; i++) {
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        UIViewController *next = nil;
+        if ([vc isKindOfClass:[UINavigationController class]]) next = ((UINavigationController *)vc).topViewController;
+        else if ([vc isKindOfClass:[UITabBarController class]]) next = ((UITabBarController *)vc).selectedViewController;
+        else if (vc.childViewControllers.count) next = vc.childViewControllers.lastObject;
+        if (!next || next == vc) break;
+        vc = next;
+    }
+    const char *cn = vc ? class_getName(object_getClass(vc)) : NULL;
+    return cn && strstr(cn, "Search") != NULL;
 }
 
 static NSString *NA9Chain(UIView *v) {
@@ -255,6 +276,12 @@ static BOOL NA9LabelIsTarget(UIView *v) {
 #if NA9_HIDE_SEARCH_SUGGESTIONS
 static __weak UIView *gSugList = nil;
 static BOOL gSugDiagShown = NO;
+#if NA9_DISCOVERY
+static NSString *gHideInfo = nil;
+static NSDate *gHideInfoAt = nil;
+static BOOL gHideInfoShown = NO;
+static void NA9DumpTree(UIView *v, int depth, NSMutableString *out, int *lines);
+#endif
 
 static UIView *NA9FindTargetLabel(UIView *v, int depth) {
     if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return nil;
@@ -298,6 +325,18 @@ static void NA9HideTick(void) {
     if (!hit) return;
     UIView *container = NA9ListFor(hit);
     if (container) {
+#if NA9_DISCOVERY
+        if (!gHideInfo) {
+            NSMutableString *info = [NSMutableString stringWithFormat:@"teks: \"%@\" [%@]\ncontainer: %@\n",
+                NA9QuickText(hit), NSStringFromClass([hit class]), NSStringFromClass([container class])];
+            [info appendString:NA9Describe(hit)];
+            int lines = 0;
+            [info appendString:@"--- pohon container ---\n"];
+            NA9DumpTree(container, 0, info, &lines);
+            gHideInfo = info;
+            gHideInfoAt = [NSDate date];
+        }
+#endif
         container.hidden = YES;
         gSugList = container;
     } else if (!gSugDiagShown && NA9TopVC() && !NA9TopVC().presentedViewController) {
@@ -395,6 +434,67 @@ static void new_setAttributedText(id self, SEL _cmd, NSAttributedString *text) {
     NA9HideNullCell(self, text.string);
 }
 
+// ---------- Placeholder kolom pencarian: hapus saran ("ginwoo") ----------
+// TikTok mengisi placeholder kolom pencarian dengan kata saran. Di sini placeholder milik AWESearchBar
+// dipaksa menjadi "Search" (teks Inggris). Dipasang lewat hook setter + penyapu cadangan di timer.
+#define NA9_CLEAN_SEARCH_PLACEHOLDER 1
+#if NA9_CLEAN_SEARCH_PLACEHOLDER
+static void (*orig_tfSetPlaceholder)(id, SEL, NSString *);
+static void (*orig_tfSetAttrPlaceholder)(id, SEL, NSAttributedString *);
+static void (*orig_sbSetPlaceholder)(id, SEL, NSString *);
+
+static BOOL NA9InTikTokSearchBar(UIView *v) {
+    UIView *p = v;
+    for (int i = 0; p && i < 8; i++, p = p.superview) {
+        const char *cn = class_getName(object_getClass(p));
+        if (cn && strncmp(cn, "AWESearchBar", 12) == 0) return YES;
+    }
+    return NO;
+}
+
+static void new_tfSetPlaceholder(id self, SEL _cmd, NSString *p) {
+    if (p.length && NA9InTikTokSearchBar(self)) p = @"Search";
+    orig_tfSetPlaceholder(self, _cmd, p);
+}
+
+static void new_tfSetAttrPlaceholder(id self, SEL _cmd, NSAttributedString *p) {
+    if (p.length && NA9InTikTokSearchBar(self)) {
+        NSDictionary *attrs = [p attributesAtIndex:0 effectiveRange:NULL];
+        p = [[NSAttributedString alloc] initWithString:@"Search" attributes:attrs];
+    }
+    orig_tfSetAttrPlaceholder(self, _cmd, p);
+}
+
+static void new_sbSetPlaceholder(id self, SEL _cmd, NSString *p) {
+    const char *cn = class_getName(object_getClass(self));
+    if (p.length && cn && strncmp(cn, "AWESearchBar", 12) == 0) p = @"Search";
+    orig_sbSetPlaceholder(self, _cmd, p);
+}
+
+static void NA9FixPlaceholders(UIView *v, int depth) {
+    if (depth > 70 || gNodeBudget-- <= 0 || v.hidden || v.alpha < 0.01) return;
+    if ([v isKindOfClass:[UITextField class]]) {
+        UITextField *tf = (UITextField *)v;
+        NSString *ph = tf.placeholder ?: tf.attributedPlaceholder.string;
+        if (ph.length && ![ph isEqualToString:@"Search"] && NA9InTikTokSearchBar(tf)) tf.placeholder = @"Search";
+        return;
+    }
+    for (UIView *sv in v.subviews) NA9FixPlaceholders(sv, depth + 1);
+}
+
+static void NA9InstallPlaceholderHooks(void) {
+    Method m1 = class_getInstanceMethod([UITextField class], @selector(setPlaceholder:));
+    if (m1) { orig_tfSetPlaceholder = (void (*)(id, SEL, NSString *))method_getImplementation(m1); method_setImplementation(m1, (IMP)new_tfSetPlaceholder); }
+    Method m2 = class_getInstanceMethod([UITextField class], @selector(setAttributedPlaceholder:));
+    if (m2) { orig_tfSetAttrPlaceholder = (void (*)(id, SEL, NSAttributedString *))method_getImplementation(m2); method_setImplementation(m2, (IMP)new_tfSetAttrPlaceholder); }
+    Method m3 = class_getInstanceMethod([UISearchBar class], @selector(setPlaceholder:));
+    if (m3) { orig_sbSetPlaceholder = (void (*)(id, SEL, NSString *))method_getImplementation(m3); method_setImplementation(m3, (IMP)new_sbSetPlaceholder); }
+}
+#else
+static void NA9InstallPlaceholderHooks(void) {}
+static void NA9FixPlaceholders(UIView *v, int depth) {}
+#endif
+
 // ---------- Tanggal upload di samping nama akun (fitur bawaan TikTok) ----------
 // TikTok punya label waktu di samping nama akun di feed ("· 13h ago", "· 9-26") yang dikontrol
 // -shouldShowTimeStampLabel. Di sini method itu dipaksa mengembalikan YES (nama class tidak perlu
@@ -414,8 +514,37 @@ static BOOL NA9NameLooksRelevant(const char *nm) {
     return NO;
 }
 
-static void NA9PatchTimestampFlag(void) {
+static void NA9PatchTimestampInClass(Class c, const char *name, NSMutableString *rep, unsigned int *patched) {
     SEL sel = NSSelectorFromString(@"shouldShowTimeStampLabel");
+    for (int pass = 0; pass < 2; pass++) {
+        Class k = pass ? object_getClass(c) : c;                      // pass 1 = class method
+        Method m = class_getInstanceMethod(k, sel);
+        if (!m) continue;
+        [rep appendFormat:@"  found %s%s\n", pass ? "+" : "-", name];
+        Class sup = class_getSuperclass(k);
+        if (sup && class_getInstanceMethod(sup, sel) == m) continue;  // warisan, bukan milik k
+        if (method_getNumberOfArguments(m) != 2) continue;
+        char *rt = method_copyReturnType(m);
+        BOOL boolish = rt && (rt[0] == 'B' || rt[0] == 'c');
+        free(rt);
+        if (!boolish || method_getImplementation(m) == (IMP)na9_yes) continue;
+        method_setImplementation(m, (IMP)na9_yes);
+        (*patched)++;
+        [rep appendFormat:@"  PATCHED %s%s\n", pass ? "+" : "-", name];
+    }
+}
+
+// Tambal dini: class yang sudah dikenal ditambal segera (sebelum video pertama dibuat).
+static void NA9PatchTimestampEarly(void) {
+    static const char *known[] = { "AWEPlayInteractionAuthorElement" };
+    unsigned int p = 0; NSMutableString *r = [NSMutableString string];
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        Class c = objc_getClass(known[i]);
+        if (c) NA9PatchTimestampInClass(c, known[i], r, &p);
+    }
+}
+
+static void NA9PatchTimestampFlag(void) {
     __block unsigned int total = 0, scanned = 0, patched = 0;
     NSMutableString *rep = [NSMutableString string];
     NA9ForEachAppClass(^(const char *name) {
@@ -423,23 +552,7 @@ static void NA9PatchTimestampFlag(void) {
         if (scanned >= 8000 || !NA9NameLooksRelevant(name)) return;
         scanned++;
         Class c = objc_getClass(name);
-        if (!c) return;
-        for (int pass = 0; pass < 2; pass++) {
-            Class k = pass ? object_getClass(c) : c;                  // pass 1 = class method
-            Method m = class_getInstanceMethod(k, sel);
-            if (!m) continue;
-            [rep appendFormat:@"  found %s%s\n", pass ? "+" : "-", name];
-            Class sup = class_getSuperclass(k);
-            if (sup && class_getInstanceMethod(sup, sel) == m) continue;   // warisan, bukan milik k
-            if (method_getNumberOfArguments(m) != 2) continue;
-            char *rt = method_copyReturnType(m);
-            BOOL boolish = rt && (rt[0] == 'B' || rt[0] == 'c');
-            free(rt);
-            if (!boolish || method_getImplementation(m) == (IMP)na9_yes) continue;
-            method_setImplementation(m, (IMP)na9_yes);
-            patched++;
-            [rep appendFormat:@"  PATCHED %s%s\n", pass ? "+" : "-", name];
-        }
+        if (c) NA9PatchTimestampInClass(c, name, rep, &patched);
     });
     @synchronized ([NSProcessInfo class]) {
         gPatchReport = [NSMutableString stringWithFormat:@"timestamp: %u kandidat diperiksa dari %u class, %u ditambal\n%@", scanned, total, patched, rep];
@@ -448,6 +561,9 @@ static void NA9PatchTimestampFlag(void) {
 }
 
 static void NA9StartTimestampPatch(void) {
+    NA9PatchTimestampEarly();                                   // langsung (sebelum video pertama)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NA9PatchTimestampEarly(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NA9PatchTimestampEarly(); });
     // Ditunda supaya tidak memperlambat peluncuran; diulang sekali untuk class yang dimuat belakangan.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NA9PatchTimestampFlag(); });
@@ -529,7 +645,6 @@ static void NA9StartHideClasses(void) {
 // Alert A (~9 dtk setelah TikTok dibuka): nama class yang cocok dengan kata kunci tiap fitur + laporan timestamp.
 // Alert B (sekitar 1.5 dtk setelah halaman pencarian terbuka): rantai view/controller kolom pencarian dan
 // pohon view halamannya. Keduanya punya tombol Copy. Set NA9_DISCOVERY ke 0 bila sudah tidak perlu.
-#define NA9_DISCOVERY 1
 #if NA9_DISCOVERY
 static BOOL gDiscAShown = NO, gDiscBShown = NO;
 static NSDate *gDiscStart = nil, *gSearchSeenAt = nil;
@@ -634,7 +749,7 @@ static NSString *NA9MatchedSelectors(Class k, const char *prefix, NSArray<NSStri
 }
 
 static BOOL gDiscCShown = NO;
-static void NA9DiscoveryC(void) {
+__attribute__((unused)) static void NA9DiscoveryC(void) {
     NSArray *storyKeys  = @[@"report", @"seen", @"viewed", @"unread", @"watched", @"mark"];
     NSArray *followKeys = @[@"limit", @"truncat", @"search", @"max", @"canShow"];
     NSArray *exact = @[@"reportStoryViewedWithStoryID:uid:completion:",
@@ -674,13 +789,79 @@ static void NA9DiscoveryC(void) {
     NA9PresentAlert(@"NA9 Discovery C", out, YES);
 }
 
+static NSString *gDiscDReport = nil;
+static BOOL gDiscDStarted = NO, gDiscDShown = NO;
+
+// Discovery D: cari class pelaksana selector yang dirujuk RX (tanpa batas 1500 seperti C) dan cetak
+// daftar method lengkap beberapa class kunci. Berjalan di antrean latar belakang.
+static void NA9DiscoveryDWork(void) {
+    NSArray *exact = @[@"reportStoryViewedWithStoryID:uid:completion:",
+                       @"reportStoryViewedWithStoryID:uid:unlocked:completion:",
+                       @"showFollowerTruncationNoticeInOtherFollowerList",
+                       @"searchEnable", @"setSearchEnable:",
+                       @"p_enableNewSearchBarForSelf", @"p_enableNewSearchBarForOther"];
+    NSArray *kw = @[@"Story", @"Skylight", @"Search", @"Relation", @"Follow", @"Fans", @"UserList", @"Viewer", @"Profile"];
+    NSMutableString *impl = [NSMutableString string];
+    __block unsigned int cand = 0;
+    NA9ForEachAppClass(^(const char *name) {
+        if (cand >= 14000) return;
+        BOOL ok = NO;
+        for (NSString *k in kw) if (strcasestr(name, k.UTF8String)) { ok = YES; break; }
+        if (!ok) return;
+        cand++;
+        Class c = objc_getClass(name);
+        if (!c) return;
+        for (int pass = 0; pass < 2; pass++) {
+            Class k = pass ? object_getClass(c) : c;
+            Class sup = class_getSuperclass(k);
+            for (NSString *e in exact) {
+                SEL sel = NSSelectorFromString(e);
+                Method m = class_getInstanceMethod(k, sel);
+                if (!m || (sup && class_getInstanceMethod(sup, sel) == m)) continue;
+                char *rt = method_copyReturnType(m);
+                [impl appendFormat:@"%s%s  %@  ret=%s args=%u\n", pass ? "+" : "-", name, e, rt ?: "?",
+                    method_getNumberOfArguments(m) - 2];
+                free(rt);
+            }
+        }
+    });
+    NSMutableString *out = [NSMutableString stringWithFormat:@"NA9 discovery D (%u class diperiksa)\n--- pelaksana selector RX ---\n%@", cand, impl];
+    NSArray *dump = @[@"TTKStoryMarkReadService", @"TTKUserProfileRelationSearchService",
+                      @"TTKRevealStoryService", @"TikTokSocialImplSwift.AvatarStoryEntranceViewModel"];
+    for (NSString *dn in dump) {
+        Class c = objc_getClass(dn.UTF8String);
+        [out appendFormat:@"--- %@ %@ ---\n", dn, c ? @"" : @"(tidak ada)"];
+        if (!c) continue;
+        for (int pass = 0; pass < 2; pass++) {
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(pass ? object_getClass(c) : c, &mc);
+            for (unsigned int i = 0; i < mc && i < 45; i++)
+                [out appendFormat:@"%s%s\n", pass ? "+" : "-", sel_getName(method_getName(ms[i]))];
+            free(ms);
+        }
+    }
+    @synchronized ([NSProcessInfo class]) { gDiscDReport = out; }
+}
+
 static void NA9DiscoveryTick(void) {
     if (!gDiscStart) gDiscStart = [NSDate date];
-    if (gDiscCShown || !gPatchRan) return;
-    if ([[NSDate date] timeIntervalSinceDate:gDiscStart] < 8) return;
+    NSTimeInterval el = [[NSDate date] timeIntervalSinceDate:gDiscStart];
+    if (!gDiscDStarted && gPatchRan && el > 5) {
+        gDiscDStarted = YES;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NA9DiscoveryDWork(); });
+    }
     if (!(NA9TopVC() && !NA9TopVC().presentedViewController)) return;
-    gDiscCShown = YES;
-    NA9DiscoveryC();
+    // E: info daftar "You may like"/"Trending" yang disembunyikan (sekali), supaya bisa disembunyikan tanpa jeda
+    if (gHideInfo && !gHideInfoShown && [[NSDate date] timeIntervalSinceDate:gHideInfoAt] > 1.0) {
+        gHideInfoShown = YES;
+        NA9PresentAlert(@"NA9 Discovery E", gHideInfo, YES);
+        return;
+    }
+    if (gDiscDReport && !gDiscDShown && !NA9SearchPageActive() && el > 9) {
+        gDiscDShown = YES;
+        NSString *r; @synchronized ([NSProcessInfo class]) { r = gDiscDReport; }
+        NA9PresentAlert(@"NA9 Discovery D", r, YES);
+    }
 }
 #else
 static void NA9DiscoveryTick(void) {}
@@ -688,10 +869,18 @@ static void NA9DiscoveryTick(void) {}
 
 static void NA9TimerStart(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [NSTimer scheduledTimerWithTimeInterval:0.7 repeats:YES block:^(NSTimer *t) {
-            NA9HideTick();
-            NA9ProbeTick();
-            NA9DiscoveryTick();
+        [NSTimer scheduledTimerWithTimeInterval:0.12 repeats:YES block:^(NSTimer *t) {
+            static int n = 0;
+            n++;
+            BOOL slow = (n % 6 == 0);                       // ~0.7 dtk
+            if (NA9SearchPageActive()) {                    // halaman pencarian: periksa cepat (~0.12 dtk)
+                NA9HideTick();
+                gNodeBudget = 6000;
+                for (UIWindow *w in NA9AllWindows()) NA9FixPlaceholders(w, 0);
+            } else if (slow) {
+                NA9HideTick();
+            }
+            if (slow) { NA9ProbeTick(); NA9DiscoveryTick(); }
         }];
     });
 }
@@ -734,5 +923,6 @@ __attribute__((constructor)) static void NA9AgeInit(void) {
         NA9TimerStart();
         NA9StartTimestampPatch();
         NA9StartHideClasses();
+        NA9InstallPlaceholderHooks();
     }
 }
