@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 OUT=build; rm -rf "$OUT"; mkdir -p "$OUT/pkg/DEBIAN" "$OUT/pkg/Library/MobileSubstrate/DynamicLibraries"
 
 xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc \
-  -miphoneos-version-min=14.0 -framework UIKit -framework Foundation \
+  -miphoneos-version-min=14.0 -framework UIKit -framework Foundation -framework CoreGraphics \
   -install_name @rpath/NA9AgeSuffix.dylib \
   -o "$OUT/pkg/Library/MobileSubstrate/DynamicLibraries/NA9AgeSuffix.dylib" Tweak.m
 ldid -S "$OUT/pkg/Library/MobileSubstrate/DynamicLibraries/NA9AgeSuffix.dylib"
