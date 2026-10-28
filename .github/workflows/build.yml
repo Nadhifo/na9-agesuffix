@@ -7,21 +7,37 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Install tools
         run: |
           export HOMEBREW_NO_AUTO_UPDATE=1
           brew install ldid dpkg
-      - name: Show toolchain
-        run: |
-          xcodebuild -version
-          xcrun -sdk iphoneos --show-sdk-path
-          which ldid dpkg-deb
+
       - name: Build
-        run: bash -x build.sh
-      - name: Upload
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+
+      - name: Tampilkan error kompilasi
+        if: failure()
+        run: |
+          echo "=== baris yang mengandung error ==="
+          grep -n -E "error" build.log | head -25 || true
+          grep -E "error" build.log | head -10 | while IFS= read -r l; do echo "::error::$l"; done || true
+
+      - name: Upload hasil
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: NA9AgeSuffix
           path: |
             build/*.deb
             build/NA9AgeSuffix.dylib
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
