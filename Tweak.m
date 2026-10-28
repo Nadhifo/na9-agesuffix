@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.2.4
+// NA9AgeSuffix v1.2.5
 //
 // 1) Menambahkan umur postingan di belakang tanggal upload NA9 TikTok:
 //      22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
@@ -108,6 +108,7 @@ static const void *kNA9SCKey        = &kNA9SCKey;         // dipasang di cell: s
 
 static NSHashTable *gNullSCs = nil;        // section controller yang menampung kartu "(null)" (pointer, weak)
 static int gSizeHits = 0;                  // berapa kali ukuran nol dikembalikan (untuk diagnosis)
+static int gSizeCalls = 0;                 // berapa kali hook ukuran dipanggil (untuk diagnosis)
 static struct { Class cls; IMP orig; } gSizeTab[4];
 static int gSizeCount = 0;
 
@@ -181,7 +182,7 @@ static void NA9NullDiag(UICollectionView *cv, UIView *cell, id sc, NSString *why
         [s appendFormat:@"sectionController: %@\n", NA9ClassChain([sc class])];
         [s appendFormat:@"sc methods: %@\n", NA9OwnMethods([sc class], sizeKeys, 30)];
     }
-    [s appendFormat:@"hook ukuran: terpasang=%d dipanggil-nol=%d\n", gSizeCount, gSizeHits];
+    [s appendFormat:@"hook ukuran: terpasang=%d dipanggil=%d dipanggil-nol=%d\n", gSizeCount, gSizeCalls, gSizeHits];
     if (log.length) { [s appendString:@"--- langkah ---\n"]; [s appendString:log]; }
     NSString *copy = [s copy];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"NA9: kartu (null) tidak bisa dirapikan"
@@ -206,6 +207,7 @@ static IMP NA9SizeOrig(id self) {
 static CGSize new_sizeForItemAtIndex(id self, SEL _cmd, NSInteger index) {
     IMP o = NA9SizeOrig(self);
     CGSize s = CGSizeMake(0, 0);
+    gSizeCalls++;
     if (o) s = ((CGSize (*)(id, SEL, NSInteger))o)(self, _cmd, index);
     if (gNullSCs.count && [gNullSCs containsObject:self]) {
         gSizeHits++;
@@ -228,6 +230,17 @@ static BOOL NA9InstallSizeHook(Class c) {
     if (!orig) return NO;
     gSizeTab[gSizeCount].cls = c; gSizeTab[gSizeCount].orig = orig; gSizeCount++;
     return YES;
+}
+
+// IGListCollectionViewLayout hanya membuang cache ukurannya bila konteks invalidasi memuat index path item
+// (invalidateLayout biasa tidak cukup). Konteks dibuat dengan item pemilik cell, lalu layout dipaksa hitung ulang.
+static void NA9ForceRelayout(UICollectionView *cv, NSIndexPath *ip) {
+    UICollectionViewLayout *layout = cv.collectionViewLayout;
+    Class ctxClass = [[layout class] invalidationContextClass];
+    UICollectionViewLayoutInvalidationContext *ctx = [[ctxClass alloc] init];
+    [ctx invalidateItemsAtIndexPaths:@[ ip ?: [NSIndexPath indexPathForItem:0 inSection:0] ]];
+    [layout invalidateLayoutWithContext:ctx];
+    [cv setNeedsLayout];
 }
 
 // Tandai section controller pemilik cell ini (tinggi nol) lalu minta layout dihitung ulang.
@@ -261,7 +274,7 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
     box.obj = sc;
     objc_setAssociatedObject(cell, kNA9SCKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    [cv.collectionViewLayout invalidateLayout];
+    NA9ForceRelayout(cv, [cv indexPathForCell:cell]);
 
     __weak UICollectionViewCell *wcell = cell;
     __weak UICollectionView *wcv = cv;
@@ -313,7 +326,7 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
             if (sc) {                                           // kembalikan ukuran normal section ini
                 [gNullSCs removeObject:sc];
                 UICollectionView *cv = NA9EnclosingCV(cell);
-                [cv.collectionViewLayout invalidateLayout];
+                if (cv) NA9ForceRelayout(cv, [cv indexPathForCell:cell]);
             }
             objc_setAssociatedObject(cell, kNA9SCKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
