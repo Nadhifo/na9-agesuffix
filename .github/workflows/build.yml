@@ -21,9 +21,9 @@ jobs:
       - name: Tampilkan error kompilasi
         if: failure()
         run: |
-          echo "=== baris yang mengandung error ==="
-          grep -n -E "error" build.log | head -25 || true
-          grep -E "error" build.log | head -10 | while IFS= read -r l; do echo "::error::$l"; done || true
+          echo "=== baris penting dari log ==="
+          grep -n -E "error|Undefined|undefined|referenced from|ld:|duplicate" build.log | head -40 || true
+          grep -E "error:|Undefined|referenced from|ld:" build.log | head -12 | while IFS= read -r l; do echo "::error::$l"; done || true
 
       - name: Upload hasil
         if: success()
