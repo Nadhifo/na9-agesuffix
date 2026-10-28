@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.2.3
+// NA9AgeSuffix v1.2.4
 //
 // 1) Menambahkan umur postingan di belakang tanggal upload NA9 TikTok:
 //      22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
@@ -133,6 +133,10 @@ static NSString *NA9ClassChain(Class c) {
     return [parts componentsJoinedByString:@" < "];
 }
 
+static NSString *NA9RectStr(CGRect r) {
+    return [NSString stringWithFormat:@"{{%.0f,%.0f},{%.0f,%.0f}}", r.origin.x, r.origin.y, r.size.width, r.size.height];
+}
+
 #if NA9_NULL_DIAG
 static BOOL gNullDiagShown = NO;
 
@@ -169,7 +173,7 @@ static void NA9NullDiag(UICollectionView *cv, UIView *cell, id sc, NSString *why
     NSArray *sizeKeys = @[@"size", @"height", @"width", @"column", @"attributes", @"prepare", @"item"];
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"alasan: %@\n", why];
-    [s appendFormat:@"cell: %@ frame=%@\n", cell ? NSStringFromClass([cell class]) : @"-", cell ? NSStringFromCGRect(cell.frame) : @"-"];
+    [s appendFormat:@"cell: %@ frame=%@\n", cell ? NSStringFromClass([cell class]) : @"-", cell ? NA9RectStr(cell.frame) : @"-"];
     [s appendFormat:@"layout: %@\n", cv ? NA9ClassChain([cv.collectionViewLayout class]) : @"-"];
     [s appendFormat:@"layout methods: %@\n", cv ? NA9OwnMethods([cv.collectionViewLayout class], sizeKeys, 30) : @"-"];
     [s appendFormat:@"delegate: %@\n", cv.delegate ? NA9ClassChain([cv.delegate class]) : @"-"];
@@ -201,7 +205,8 @@ static IMP NA9SizeOrig(id self) {
 
 static CGSize new_sizeForItemAtIndex(id self, SEL _cmd, NSInteger index) {
     IMP o = NA9SizeOrig(self);
-    CGSize s = o ? ((CGSize (*)(id, SEL, NSInteger))o)(self, _cmd, index) : CGSizeZero;
+    CGSize s = CGSizeMake(0, 0);
+    if (o) s = ((CGSize (*)(id, SEL, NSInteger))o)(self, _cmd, index);
     if (gNullSCs.count && [gNullSCs containsObject:self]) {
         gSizeHits++;
         return CGSizeMake(s.width, 0);                 // lebar dipertahankan, tinggi nol
@@ -241,7 +246,7 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
     id sc = ((id (*)(id, SEL, id))objc_msgSend)(adapter, selSC, cell);
     if (!sc) { NA9NullDiag(cv, cell, nil, @"section controller tidak ditemukan", log); return; }
     [log appendFormat:@"adapter=%@ sc=%@\n", NSStringFromClass([adapter class]), NSStringFromClass([sc class])];
-    [log appendFormat:@"frame sebelum=%@\n", NSStringFromCGRect(cell.frame)];
+    [log appendFormat:@"frame sebelum=%@\n", NA9RectStr(cell.frame)];
 
     if ([sc respondsToSelector:selNum]) {
         long n = ((long (*)(id, SEL))objc_msgSend)(sc, selNum);
@@ -264,7 +269,7 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UICollectionViewCell *c = wcell;
         if (c && c.window && objc_getAssociatedObject(c, kNA9HiddenByKey) && c.frame.size.height > 2) {
-            [log appendFormat:@"frame sesudah=%@\n", NSStringFromCGRect(c.frame)];
+            [log appendFormat:@"frame sesudah=%@\n", NA9RectStr(c.frame)];
             NA9NullDiag(wcv, c, wsc, @"kartu masih memakan ruang setelah ukuran dinolkan", log);
         }
     });
