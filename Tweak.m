@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.2.1
+// NA9AgeSuffix v1.2.2
 //
 // 1) Menambahkan umur postingan di belakang tanggal upload NA9 TikTok:
 //      22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
@@ -116,14 +116,14 @@ static UICollectionView *NA9EnclosingCV(UIView *v) {
     return nil;
 }
 
-#if NA9_NULL_DIAG
-static BOOL gNullDiagShown = NO;
-
 static NSString *NA9ClassChain(Class c) {
     NSMutableArray *parts = [NSMutableArray array];
     for (int i = 0; c && i < 8; i++, c = class_getSuperclass(c)) [parts addObject:NSStringFromClass(c)];
     return [parts componentsJoinedByString:@" < "];
 }
+
+#if NA9_NULL_DIAG
+static BOOL gNullDiagShown = NO;
 
 static UIViewController *NA9TopVC(void) {
     UIWindow *win = nil;
@@ -136,7 +136,7 @@ static UIViewController *NA9TopVC(void) {
     return top;
 }
 
-static void NA9NullDiag(UICollectionView *cv, UIView *cell, NSString *why) {
+static void NA9NullDiag(UICollectionView *cv, UIView *cell, NSString *why, NSString *log) {
     if (gNullDiagShown) return;
     UIViewController *top = NA9TopVC();
     if (!top || top.presentedViewController) return;
@@ -151,6 +151,7 @@ static void NA9NullDiag(UICollectionView *cv, UIView *cell, NSString *why) {
     UIResponder *r = cv;
     while (r && ![r isKindOfClass:[UIViewController class]]) r = r.nextResponder;
     [s appendFormat:@"controller: %@\n", r ? NA9ClassChain([r class]) : @"-"];
+    if (log.length) { [s appendString:@"--- langkah ---\n"]; [s appendString:log]; }
     NSString *copy = [s copy];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"NA9: kartu (null) tidak bisa dirapikan"
                                                                message:copy
@@ -161,12 +162,26 @@ static void NA9NullDiag(UICollectionView *cv, UIView *cell, NSString *why) {
     [top presentViewController:a animated:YES completion:nil];
 }
 #else
-static void NA9NullDiag(UICollectionView *cv, UIView *cell, NSString *why) {}
+static void NA9NullDiag(UICollectionView *cv, UIView *cell, NSString *why, NSString *log) {}
 #endif
 
 // ---------- Filter pada IGListAdapterDataSource.objectsForListAdapter: ----------
+static NSMutableSet *gBlockedIDs = nil;                    // diffIdentifier (NSString/NSNumber) yang dikeluarkan
 static struct { Class cls; IMP orig; } gDSTab[4];
 static int gDSCount = 0;
+
+static id NA9DiffID(id obj) {
+    SEL sel = NSSelectorFromString(@"diffIdentifier");
+    if (![obj respondsToSelector:sel]) return nil;
+    id d = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+    return ([d isKindOfClass:[NSString class]] || [d isKindOfClass:[NSNumber class]]) ? d : nil;
+}
+
+static BOOL NA9IsBlockedObj(id obj) {
+    if ([gBlockedObjs containsObject:obj]) return YES;
+    if (gBlockedIDs.count) { id d = NA9DiffID(obj); if (d && [gBlockedIDs containsObject:d]) return YES; }
+    return NO;
+}
 
 static IMP NA9DSOrig(id self) {
     for (Class k = object_getClass(self); k; k = class_getSuperclass(k))
@@ -177,10 +192,12 @@ static IMP NA9DSOrig(id self) {
 static NSArray *new_objectsForListAdapter(id self, SEL _cmd, id adapter) {
     IMP o = NA9DSOrig(self);
     NSArray *arr = o ? ((NSArray *(*)(id, SEL, id))o)(self, _cmd, adapter) : nil;
-    if (![arr isKindOfClass:[NSArray class]] || gBlockedObjs.count == 0) return arr;
+    if (![arr isKindOfClass:[NSArray class]] || (gBlockedObjs.count == 0 && gBlockedIDs.count == 0)) return arr;
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
-    for (id obj in arr) if (![gBlockedObjs containsObject:obj]) [out addObject:obj];
-    return out.count == arr.count ? arr : out;
+    int removed = 0;
+    for (id obj in arr) { if (NA9IsBlockedObj(obj)) removed++; else [out addObject:obj]; }
+    if (removed == 0 || removed > 3) return arr;          // katup pengaman: tidak pernah membuang banyak sekaligus
+    return out;
 }
 
 static BOOL NA9InstallDSFilter(Class c) {
@@ -200,40 +217,71 @@ static BOOL NA9InstallDSFilter(Class c) {
 }
 
 // Keluarkan item pemilik cell ini dari daftar (IGListKit), supaya tidak ada ruang kosong di grid.
+// Setiap langkah dicatat di `log`; bila gagal / tidak berefek, muncul SATU alert diagnosis.
 static void NA9TryRemoveNullItem(UICollectionViewCell *cell) {
+    NSMutableString *log = [NSMutableString string];
     UICollectionView *cv = NA9EnclosingCV(cell);
-    if (!cv) return;
+    if (!cv) { NA9NullDiag(nil, cell, @"collection view tidak ditemukan", log); return; }
 
     SEL selSC  = NSSelectorFromString(@"sectionControllerForView:");
     SEL selObj = NSSelectorFromString(@"objectForSectionController:");
     SEL selDS  = NSSelectorFromString(@"dataSource");
     SEL selUp  = NSSelectorFromString(@"performUpdatesAnimated:completion:");
+    SEL selNum = NSSelectorFromString(@"numberOfItems");
+
+    NSIndexPath *ip = [cv indexPathForCell:(UICollectionViewCell *)cell];
+    [log appendFormat:@"indexPath=%@ sections=%ld items(sec0)=%ld\n", ip, (long)cv.numberOfSections,
+        cv.numberOfSections ? (long)[cv numberOfItemsInSection:0] : -1L];
 
     id adapter = nil;
     if ([cv.dataSource respondsToSelector:selSC]) adapter = cv.dataSource;
     else if ([cv.delegate respondsToSelector:selSC]) adapter = cv.delegate;
-    if (!adapter) { NA9NullDiag(cv, cell, @"adapter IGListKit tidak ditemukan"); return; }
+    if (!adapter) { NA9NullDiag(cv, cell, @"adapter IGListKit tidak ditemukan", log); return; }
+    [log appendFormat:@"adapter=%@\n", NA9ClassChain([adapter class])];
     if (![adapter respondsToSelector:selObj] || ![adapter respondsToSelector:selDS] || ![adapter respondsToSelector:selUp]) {
-        NA9NullDiag(cv, cell, @"adapter tidak punya selector yang diperlukan"); return;
+        NA9NullDiag(cv, cell, @"adapter tidak punya selector yang diperlukan", log); return;
     }
 
     id sc = ((id (*)(id, SEL, id))objc_msgSend)(adapter, selSC, cell);
-    if (!sc) { NA9NullDiag(cv, cell, @"section controller tidak ditemukan"); return; }
+    if (!sc) { NA9NullDiag(cv, cell, @"section controller tidak ditemukan", log); return; }
+    [log appendFormat:@"sectionController=%@\n", NA9ClassChain([sc class])];
+    if ([sc respondsToSelector:selNum]) {
+        long n = ((long (*)(id, SEL))objc_msgSend)(sc, selNum);
+        [log appendFormat:@"numberOfItems=%ld\n", n];
+        if (n > 1) { NA9NullDiag(cv, cell, @"satu section berisi banyak item: tidak aman dikeluarkan", log); return; }
+    }
+
     id obj = ((id (*)(id, SEL, id))objc_msgSend)(adapter, selObj, sc);
-    if (!obj) { NA9NullDiag(cv, cell, @"objek item tidak ditemukan"); return; }
+    if (!obj) { NA9NullDiag(cv, cell, @"objek item tidak ditemukan", log); return; }
+    id did = NA9DiffID(obj);
+    [log appendFormat:@"object=%@ diffID=%@\n", NA9ClassChain([obj class]),
+        did ? [[did description] substringToIndex:MIN((NSUInteger)60, [[did description] length])] : @"(bukan string/angka)"];
+
     id ds = ((id (*)(id, SEL))objc_msgSend)(adapter, selDS);
-    if (!ds || !NA9InstallDSFilter([ds class])) { NA9NullDiag(cv, cell, @"dataSource tidak punya objectsForListAdapter:"); return; }
+    if (!ds) { NA9NullDiag(cv, cell, @"dataSource adapter kosong", log); return; }
+    [log appendFormat:@"adapter.dataSource=%@\n", NA9ClassChain([ds class])];
+    if (!NA9InstallDSFilter([ds class])) { NA9NullDiag(cv, cell, @"dataSource tidak punya objectsForListAdapter:", log); return; }
 
     // Batas laju: mencegah putaran tak berujung bila objek dibuat ulang tiap kali.
     NSDate *now = [NSDate date];
     if (!gRemoveWindowStart || [now timeIntervalSinceDate:gRemoveWindowStart] > 20) { gRemoveWindowStart = now; gRemoveCount = 0; }
-    if (gRemoveCount >= 8) return;                       // cukup: kartu tetap tersembunyi
-    if ([gBlockedObjs containsObject:obj]) return;
+    if (gRemoveCount >= 8) { NA9NullDiag(cv, cell, @"batas laju tercapai (objek terus dibuat ulang?)", log); return; }
     gRemoveCount++;
 
     if (!gBlockedObjs) gBlockedObjs = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
+    if (!gBlockedIDs) gBlockedIDs = [NSMutableSet set];
     [gBlockedObjs addObject:obj];
+    if (did) [gBlockedIDs addObject:did];
     ((void (*)(id, SEL, BOOL, id))objc_msgSend)(adapter, selUp, NO, nil);
+
+    // Verifikasi: bila kartu masih tampil setelah pembaruan, laporkan.
+    __weak UICollectionViewCell *wcell = cell;
+    __weak UICollectionView *wcv = cv;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UICollectionViewCell *c = wcell;
+        if (c && c.window && objc_getAssociatedObject(c, kNA9HiddenByKey))
+            NA9NullDiag(wcv, c, @"kartu masih ada setelah pembaruan daftar", log);
+    });
 }
 
 // text == persis "(null)"  -> sembunyikan cell pembungkus label ini, lalu keluarkan dari daftar.
@@ -317,6 +365,7 @@ __attribute__((constructor)) static void NA9AgeInit(void) {
         gFormatters = fs;
 
         gBlockedObjs = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
+        gBlockedIDs = [NSMutableSet set];
 
         Method m1 = class_getInstanceMethod([UILabel class], @selector(setText:));
         orig_setText = (void (*)(id, SEL, NSString *))method_getImplementation(m1);
