@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.2.6
+// NA9AgeSuffix v1.2.7
 //
 // 1) Menambahkan umur postingan di belakang tanggal upload NA9 TikTok:
 //      22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
@@ -113,8 +113,9 @@ static struct { Class cls; IMP orig; } gSizeTab[4];
 static int gSizeCount = 0;
 static struct { Class cls; IMP orig; } gLayTab[2];
 static int gLayCount = 0, gLayCalls = 0, gLayAdjusted = 0;
-static NSMutableDictionary<NSNumber *, NSValue *> *gNullInfo = nil;   // section -> bingkai asli kartu null (tinggi > 2)
-static CGFloat gGapGuess = 8;                                          // jarak antarkartu dalam satu kolom
+static NSMutableDictionary<NSNumber *, NSValue *> *gNullInfo = nil;   // section -> CGRect(x, y asli, lebar, delta = ruang yang harus dibuang)
+static CGFloat gGapGuess = 0;                                          // jarak antarkartu dalam satu kolom
+static CGFloat gMaxShift = 0;                                          // total pergeseran naik yang diketahui (untuk memperluas rect)
 
 static UICollectionViewCell *NA9EnclosingCell(UIView *v) {
     UIView *p = v;
@@ -288,30 +289,21 @@ static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect 
     if (nullSecs.count == 0) return o(self, _cmd, rect);
 
     // Perluas rect ke bawah sebesar total pergeseran yang diketahui, supaya kartu yang naik ke dalam rect ikut terambil.
-    CGFloat extra = 0;
-    for (NSNumber *k in nullSecs) { NSValue *v = gNullInfo[k]; if (v) extra += v.CGRectValue.size.height + gGapGuess; }
     CGRect big = rect;
-    big.size.height += extra;
+    big.size.height += gMaxShift;
     NSArray *attrs = o(self, _cmd, big);
     if (![attrs isKindOfClass:[NSArray class]] || attrs.count == 0) return attrs;
 
-    // 1) catat bingkai asli kartu null (tinggi > 2); bila sudah ciut dari layout, hapus catatannya.
-    for (UICollectionViewLayoutAttributes *a in attrs) {
-        if (a.representedElementCategory != UICollectionElementCategoryCell) continue;
-        NSNumber *key = @(a.indexPath.section);
-        if (![nullSecs containsObject:key]) continue;
-        if (a.frame.size.height > 2) gNullInfo[key] = [NSValue valueWithCGRect:a.frame];
-        else [gNullInfo removeObjectForKey:key];
-    }
-    if (gNullInfo.count == 0) return o(self, _cmd, rect);   // layout menciutkan sendiri: tidak diubah
-
-    // 2) perkirakan jarak antarkartu dari kartu biasa dalam satu kolom
     NSMutableArray<UICollectionViewLayoutAttributes *> *cells = [NSMutableArray array];
     for (UICollectionViewLayoutAttributes *a in attrs)
-        if (a.representedElementCategory == UICollectionElementCategoryCell && !gNullInfo[@(a.indexPath.section)]) [cells addObject:a];
+        if (a.representedElementCategory == UICollectionElementCategoryCell) [cells addObject:a];
+
+    // 1) jarak antarkartu dari kartu biasa dalam satu kolom
     for (UICollectionViewLayoutAttributes *a in cells) {
+        if ([nullSecs containsObject:@(a.indexPath.section)]) continue;
         CGFloat best = CGFLOAT_MAX;
         for (UICollectionViewLayoutAttributes *b in cells) {
+            if ([nullSecs containsObject:@(b.indexPath.section)]) continue;
             if (fabs(a.frame.origin.x - b.frame.origin.x) > 1 || b.frame.origin.y <= a.frame.origin.y) continue;
             CGFloat g = b.frame.origin.y - (a.frame.origin.y + a.frame.size.height);
             if (g >= 0 && g < best) best = g;
@@ -319,37 +311,52 @@ static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect 
         if (best < 40) { gGapGuess = best; break; }
     }
 
-    // 3) bangun hasil
+    // 2) untuk tiap kartu null: ruang yang harus dibuang = jarak ke kartu berikutnya di kolom yang sama dikurangi jarak normal.
+    //    Dihitung dari posisi nyata (bukan dari tinggi atribut), jadi tetap benar walau layout sudah menciutkan atributnya sendiri.
+    for (UICollectionViewLayoutAttributes *n in cells) {
+        NSNumber *key = @(n.indexPath.section);
+        if (![nullSecs containsObject:key]) continue;
+        CGFloat nx = n.frame.origin.x, ny = n.frame.origin.y, nextY = CGFLOAT_MAX;
+        for (UICollectionViewLayoutAttributes *c in cells) {
+            if (c == n || fabs(c.frame.origin.x - nx) > 1 || c.frame.origin.y <= ny + 0.5) continue;
+            if (c.frame.origin.y < nextY) nextY = c.frame.origin.y;
+        }
+        CGFloat delta;
+        if (nextY != CGFLOAT_MAX) delta = MAX((CGFloat)0, nextY - ny - gGapGuess);
+        else if (n.frame.size.height > 2) delta = n.frame.size.height;
+        else continue;                                   // belum bisa dihitung: pertahankan catatan lama
+        gNullInfo[key] = [NSValue valueWithCGRect:CGRectMake(nx, ny, n.frame.size.width, delta)];
+    }
+    CGFloat total = 0;
+    for (NSNumber *k in gNullInfo) total += gNullInfo[k].CGRectValue.size.height;
+    gMaxShift = total;
+
+    // 3) bangun hasil: kartu null tinggi nol; kartu di bawahnya dalam kolom yang sama naik sebesar delta
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:attrs.count];
     for (UICollectionViewLayoutAttributes *a in attrs) {
         CGRect f = a.frame;
         BOOL isCell = (a.representedElementCategory == UICollectionElementCategoryCell);
-        if (isCell && gNullInfo[@(a.indexPath.section)]) {                  // kartu null: tinggi nol
-            if (NA9YOverlap(f, rect)) {
-                UICollectionViewLayoutAttributes *c = [a copy];
-                c.frame = CGRectMake(f.origin.x, f.origin.y, f.size.width, 0);
-                [out addObject:c];
-                gLayAdjusted++;
-            }
-            continue;
-        }
+        NSNumber *key = @(a.indexPath.section);
+        BOOL isNull = isCell && [nullSecs containsObject:key];
         CGFloat shift = 0;
         if (isCell) {
             for (NSNumber *k in gNullInfo) {
-                CGRect nf = gNullInfo[k].CGRectValue;
-                // hanya kartu yang seluruhnya di bawah kartu null dalam kolom yang sama
-                if (fabs(f.origin.x - nf.origin.x) < 1 && f.origin.y >= nf.origin.y + nf.size.height - 1)
-                    shift += nf.size.height + gGapGuess;
+                if (isNull && [k isEqual:key]) continue;
+                CGRect ni = gNullInfo[k].CGRectValue;
+                if (fabs(f.origin.x - ni.origin.x) < 1 && f.origin.y > ni.origin.y + 0.5) shift += ni.size.height;
             }
         }
-        if (shift > 0) {
-            f.origin.y -= shift;
-            if (!NA9YOverlap(f, rect)) continue;
+        f.origin.y -= shift;
+        if (isNull) f.size.height = 0;
+        BOOL keep = isNull ? (f.origin.y <= rect.origin.y + rect.size.height && f.origin.y >= rect.origin.y - 1)
+                           : NA9YOverlap(f, rect);
+        if (!keep) continue;
+        if (shift > 0 || isNull) {
             UICollectionViewLayoutAttributes *c = [a copy];
             c.frame = f;
             [out addObject:c];
             gLayAdjusted++;
-        } else if (NA9YOverlap(f, rect)) {
+        } else {
             [out addObject:a];
         }
     }
@@ -399,10 +406,6 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
 
     if (!gNullSCs) gNullSCs = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
     [gNullSCs addObject:sc];
-    NA9WeakBox *box = [NA9WeakBox new];
-    box.obj = sc;
-    objc_setAssociatedObject(cell, kNA9SCKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
     if (!NA9InstallLayoutHook([cv.collectionViewLayout class]))
         [log appendString:@"hook layout gagal dipasang\n"];
     NA9ForceRelayout(cv, [cv indexPathForCell:cell]);
@@ -410,7 +413,7 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
     __weak UICollectionView *wcv = cv;
     __weak id wsc = sc;
     __weak UICollectionViewCell *wcell = cell;
-    // Verifikasi lewat keluaran layout (bukan frame cell): bila atribut kartu null masih tinggi, laporkan.
+    // Verifikasi lewat keluaran layout: jarak dari kartu null ke kartu berikutnya di kolomnya harus ~ jarak normal.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UICollectionView *v = wcv;
         id s2 = wsc;
@@ -419,12 +422,22 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
         NSInteger sec = NA9SectionFor(v.dataSource, s2);
         if (sec == NSNotFound) return;
         NSArray *as = [v.collectionViewLayout layoutAttributesForElementsInRect:CGRectMake(0, 0, v.bounds.size.width, v.contentSize.height + 2000)];
+        UICollectionViewLayoutAttributes *n = nil;
+        for (UICollectionViewLayoutAttributes *a in as)
+            if (a.representedElementCategory == UICollectionElementCategoryCell && a.indexPath.section == sec) { n = a; break; }
+        if (!n) return;
+        CGFloat nextY = CGFLOAT_MAX;
         for (UICollectionViewLayoutAttributes *a in as) {
-            if (a.representedElementCategory == UICollectionElementCategoryCell && a.indexPath.section == sec && a.frame.size.height > 2) {
-                [log appendFormat:@"atribut section %ld: %@\n", (long)sec, NA9RectStr(a.frame)];
-                NA9NullDiag(v, c, s2, @"atribut kartu masih tinggi setelah penyesuaian layout", log);
-                return;
-            }
+            if (a == n || a.representedElementCategory != UICollectionElementCategoryCell) continue;
+            if (fabs(a.frame.origin.x - n.frame.origin.x) > 1 || a.frame.origin.y <= n.frame.origin.y + 0.5) continue;
+            if (a.frame.origin.y < nextY) nextY = a.frame.origin.y;
+        }
+        if (nextY == CGFLOAT_MAX) return;
+        CGFloat blank = nextY - n.frame.origin.y - gGapGuess;
+        if (blank > 6) {
+            [log appendFormat:@"section %ld: y=%.0f h=%.0f, kartu berikutnya y=%.0f, sisa ruang=%.0f\n", (long)sec,
+                n.frame.origin.y, n.frame.size.height, nextY, blank];
+            NA9NullDiag(v, c, s2, @"masih ada ruang kosong di bawah kartu null", log);
         }
     });
 }
@@ -462,14 +475,8 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
             objc_setAssociatedObject(cell, kNA9HiddenByKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             cell.hidden = NO;
             cell.userInteractionEnabled = YES;
-            NA9WeakBox *box = objc_getAssociatedObject(cell, kNA9SCKey);
-            id sc = box.obj;
-            if (sc) {                                           // kembalikan ukuran normal section ini
-                [gNullSCs removeObject:sc];
-                UICollectionView *cv = NA9EnclosingCV(cell);
-                if (cv) NA9ForceRelayout(cv, [cv indexPathForCell:cell]);
-            }
-            objc_setAssociatedObject(cell, kNA9SCKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // Tanda section controller (gNullSCs) sengaja TIDAK dilepas di sini: cell ini bisa saja dipakai ulang untuk
+            // kartu lain, sedangkan item null milik section controller itu tetap null.
         }
     }
 }
