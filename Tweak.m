@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.2.8
+// NA9AgeSuffix v1.2.9
 //
 // 1) Menambahkan umur postingan di belakang tanggal upload NA9 TikTok:
 //      22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
@@ -99,6 +99,8 @@ static NSString *NA9Decorate(NSString *text) {
 static const void *kNA9NullLabelKey = &kNA9NullLabelKey;  // dipasang di UILabel pemicu
 static const void *kNA9HiddenByKey  = &kNA9HiddenByKey;   // dipasang di cell: label pemicu
 static const void *kNA9SCKey        = &kNA9SCKey;         // dipasang di cell: section controller (weak)
+static const void *kNA9RetryKey     = &kNA9RetryKey;      // jumlah percobaan ulang (label / cell)
+static const void *kNA9ClipKey      = &kNA9ClipKey;       // clipsToBounds asli cell
 
 @interface NA9WeakBox : NSObject
 @property (nonatomic, weak) id obj;
@@ -319,6 +321,8 @@ static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect 
                 [gNullSCs removeObject:sc];
                 cell.hidden = NO;
                 cell.userInteractionEnabled = YES;
+                NSNumber *clip = objc_getAssociatedObject(cell, kNA9ClipKey);
+                if (clip) { cell.clipsToBounds = clip.boolValue; objc_setAssociatedObject(cell, kNA9ClipKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
                 objc_setAssociatedObject(cell, kNA9HiddenByKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 NA9ForceRelayout(cv, ip);
             });
@@ -392,6 +396,7 @@ static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect 
         if (shift > 0 || isNull) {
             UICollectionViewLayoutAttributes *c = [a copy];
             c.frame = f;
+            if (isNull) { c.hidden = YES; c.alpha = 0; }
             [out addObject:c];
             gLayAdjusted++;
         } else {
@@ -483,11 +488,25 @@ static BOOL NA9InstallLayoutHook(Class c) {
     return YES;
 }
 
+static void NA9CollapseNullItem(UICollectionViewCell *cell);
+
+// Kondisi sementara (cell baru dibuat / sedang didaur ulang, belum terpetakan ke section controller): coba lagi tanpa alert.
+static void NA9RetryCollapse(UICollectionViewCell *cell) {
+    NSNumber *tries = objc_getAssociatedObject(cell, kNA9RetryKey);
+    if (tries.intValue >= 4) return;
+    objc_setAssociatedObject(cell, kNA9RetryKey, @(tries.intValue + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UICollectionViewCell *wc = cell;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UICollectionViewCell *c = wc;
+        if (c && NA9HasNullLabel(c, 0)) NA9CollapseNullItem(c);
+    });
+}
+
 // Tandai section controller pemilik cell ini (tinggi nol) lalu minta layout dihitung ulang.
 static void NA9CollapseNullItem(UICollectionViewCell *cell) {
     NSMutableString *log = [NSMutableString string];
     UICollectionView *cv = NA9EnclosingCV(cell);
-    if (!cv) { NA9NullDiag(nil, cell, nil, @"collection view tidak ditemukan", log); return; }
+    if (!cv) { NA9RetryCollapse(cell); return; }
 
     SEL selSC  = NSSelectorFromString(@"sectionControllerForView:");
     SEL selNum = NSSelectorFromString(@"numberOfItems");
@@ -497,7 +516,7 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
     if (!adapter) { NA9NullDiag(cv, cell, nil, @"adapter IGListKit tidak ditemukan", log); return; }
 
     id sc = ((id (*)(id, SEL, id))objc_msgSend)(adapter, selSC, cell);
-    if (!sc) { NA9NullDiag(cv, cell, nil, @"section controller tidak ditemukan", log); return; }
+    if (!sc) { NA9RetryCollapse(cell); return; }
     [log appendFormat:@"adapter=%@ sc=%@\n", NSStringFromClass([adapter class]), NSStringFromClass([sc class])];
     [log appendFormat:@"frame sebelum=%@\n", NA9RectStr(cell.frame)];
 
@@ -555,12 +574,28 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
     BOOL isNull = [text isKindOfClass:[NSString class]] && [text isEqualToString:@"(null)"];
     if (isNull) {
         UICollectionViewCell *cell = NA9EnclosingCell(label);
-        if (!cell) return;
+        if (!cell) {
+            // Cell baru dibuat: label belum terpasang di hierarki cell. Coba lagi sebentar (maks. 6 kali).
+            NSNumber *tries = objc_getAssociatedObject(label, kNA9RetryKey);
+            if (tries.intValue >= 6) return;
+            objc_setAssociatedObject(label, kNA9RetryKey, @(tries.intValue + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            __weak UILabel *wl = label;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UILabel *l = wl;
+                if (!l) return;
+                NSString *t = l.text ?: l.attributedText.string;
+                if ([t isEqualToString:@"(null)"]) NA9HideNullCell(l, t);
+            });
+            return;
+        }
         BOOL first = (objc_getAssociatedObject(cell, kNA9HiddenByKey) == nil);
         objc_setAssociatedObject(label, kNA9NullLabelKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(cell, kNA9HiddenByKey,
                                  [NSValue valueWithPointer:(__bridge const void *)label],
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!objc_getAssociatedObject(cell, kNA9ClipKey))
+            objc_setAssociatedObject(cell, kNA9ClipKey, @(cell.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        cell.clipsToBounds = YES;                         // cell bertinggi nol tidak menggambar isinya
         cell.hidden = YES;
         cell.userInteractionEnabled = NO;
         if (first) {
@@ -569,7 +604,7 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
             // sesaat berisi "(null)" (mis. skeleton yang segera terisi).
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 UICollectionViewCell *c = wcell;
-                if (c && c.hidden && NA9HasNullLabel(c, 0)) NA9CollapseNullItem(c);
+                if (c && NA9HasNullLabel(c, 0)) NA9CollapseNullItem(c);
             });
         }
         return;
@@ -580,10 +615,12 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
         NSValue *owner = cell ? objc_getAssociatedObject(cell, kNA9HiddenByKey) : nil;
         if (owner && owner.pointerValue == (__bridge const void *)label) {
             objc_setAssociatedObject(cell, kNA9HiddenByKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NSNumber *clip = objc_getAssociatedObject(cell, kNA9ClipKey);
+            if (clip) { cell.clipsToBounds = clip.boolValue; objc_setAssociatedObject(cell, kNA9ClipKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
             cell.hidden = NO;
             cell.userInteractionEnabled = YES;
             // Tanda section controller (gNullSCs) sengaja TIDAK dilepas di sini: cell ini bisa saja dipakai ulang untuk
-            // kartu lain, sedangkan item null milik section controller itu tetap null.
+            // kartu lain; pelepasan dilakukan oleh validasi di hook layout berdasarkan isi cell yang tampil.
         }
     }
 }
