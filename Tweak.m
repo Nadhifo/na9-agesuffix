@@ -1,4 +1,4 @@
-// NA9AgeSuffix v1.2.7
+// NA9AgeSuffix v1.2.8
 //
 // 1) Menambahkan umur postingan di belakang tanggal upload NA9 TikTok:
 //      22/10/26, 04.31  ->  22/10/26, 04.31 - 4h
@@ -111,7 +111,12 @@ static int gSizeHits = 0;                  // berapa kali ukuran nol dikembalika
 static int gSizeCalls = 0;                 // berapa kali hook ukuran dipanggil (untuk diagnosis)
 static struct { Class cls; IMP orig; } gSizeTab[4];
 static int gSizeCount = 0;
+typedef NSArray *(*NA9AttrsFn)(id, SEL, CGRect);
 static struct { Class cls; IMP orig; } gLayTab[2];
+static struct { Class cls; IMP orig; } gCSTab[2];
+static int gCSCount = 0;
+static CGFloat gOrigContentH = 0, gShrink = 0;      // tinggi konten asli dan pengurangannya akibat kartu null dibuang
+static BOOL gInCS = NO;
 static int gLayCount = 0, gLayCalls = 0, gLayAdjusted = 0;
 static NSMutableDictionary<NSNumber *, NSValue *> *gNullInfo = nil;   // section -> CGRect(x, y asli, lebar, delta = ruang yang harus dibuang)
 static CGFloat gGapGuess = 0;                                          // jarak antarkartu dalam satu kolom
@@ -270,8 +275,18 @@ static BOOL NA9YOverlap(CGRect f, CGRect rect) {
     return f.origin.y < rect.origin.y + rect.size.height && f.origin.y + f.size.height > rect.origin.y;
 }
 
+static BOOL NA9HasNullLabel(UIView *v, int depth) {
+    if (depth > 10) return NO;
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        NSString *t = l.text ?: l.attributedText.string;
+        if ([t isEqualToString:@"(null)"]) return YES;
+    }
+    for (UIView *sv in v.subviews) if (NA9HasNullLabel(sv, depth + 1)) return YES;
+    return NO;
+}
+
 static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect rect) {
-    typedef NSArray *(*NA9AttrsFn)(id, SEL, CGRect);
     NA9AttrsFn o = (NA9AttrsFn)NA9LayOrig(self);
     if (!o) return nil;
     gLayCalls++;
@@ -287,6 +302,28 @@ static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect 
     if (!gNullInfo) gNullInfo = [NSMutableDictionary dictionary];
     for (NSNumber *k in gNullInfo.allKeys) if (![nullSecs containsObject:k]) [gNullInfo removeObjectForKey:k];
     if (nullSecs.count == 0) return o(self, _cmd, rect);
+
+    // Validasi (maks. tiap 0,4 dtk): bila cell section yang ditandai sedang tampil dan TIDAK lagi berisi "(null)",
+    // berarti datanya sudah valid (mis. kartu skeleton yang akhirnya terisi): lepaskan tandanya.
+    static NSTimeInterval sLastValidate = 0;
+    NSTimeInterval nowT = [NSDate timeIntervalSinceReferenceDate];
+    if (nowT - sLastValidate > 0.4) {
+        sLastValidate = nowT;
+        for (id sc in gNullSCs.allObjects) {
+            NSInteger sec = NA9SectionFor(adapter, sc);
+            if (sec == NSNotFound) continue;
+            NSIndexPath *ip = [NSIndexPath indexPathForItem:0 inSection:sec];
+            UICollectionViewCell *cell = [cv cellForItemAtIndexPath:ip];
+            if (!cell || NA9HasNullLabel(cell, 0)) continue;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [gNullSCs removeObject:sc];
+                cell.hidden = NO;
+                cell.userInteractionEnabled = YES;
+                objc_setAssociatedObject(cell, kNA9HiddenByKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                NA9ForceRelayout(cv, ip);
+            });
+        }
+    }
 
     // Perluas rect ke bawah sebesar total pergeseran yang diketahui, supaya kartu yang naik ke dalam rect ikut terambil.
     CGRect big = rect;
@@ -346,6 +383,7 @@ static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect 
                 if (fabs(f.origin.x - ni.origin.x) < 1 && f.origin.y > ni.origin.y + 0.5) shift += ni.size.height;
             }
         }
+        if (!isCell && gShrink > 0 && gOrigContentH > 0 && f.origin.y >= gOrigContentH * 0.5) shift = gShrink;   // footer di dasar daftar
         f.origin.y -= shift;
         if (isNull) f.size.height = 0;
         BOOL keep = isNull ? (f.origin.y <= rect.origin.y + rect.size.height && f.origin.y >= rect.origin.y - 1)
@@ -361,6 +399,72 @@ static NSArray *new_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect 
         }
     }
     return out;
+}
+
+static IMP NA9CSOrig(id self) {
+    for (Class k = object_getClass(self); k; k = class_getSuperclass(k))
+        for (int i = 0; i < gCSCount; i++) if (gCSTab[i].cls == k) return gCSTab[i].orig;
+    return NULL;
+}
+
+// Tinggi konten dikurangi sesuai ruang yang dibuang, supaya tidak ada layar kosong di ujung bawah daftar.
+static CGSize new_collectionViewContentSize(id self, SEL _cmd) {
+    IMP o = NA9CSOrig(self);
+    CGSize s = CGSizeMake(0, 0);
+    if (o) s = ((CGSize (*)(id, SEL))o)(self, _cmd);
+    gOrigContentH = s.height;
+    gShrink = 0;
+    if (gInCS || gNullInfo.count == 0 || s.height <= 0) return s;
+    NA9AttrsFn raw = (NA9AttrsFn)NA9LayOrig(self);       // keluaran asli layout, tanpa penyesuaian
+    if (!raw) return s;
+    gInCS = YES;
+    NSArray *attrs = raw(self, NSSelectorFromString(@"layoutAttributesForElementsInRect:"), CGRectMake(0, 0, s.width, s.height));
+    gInCS = NO;
+    if (![attrs isKindOfClass:[NSArray class]]) return s;
+
+    NSMutableArray<NSNumber *> *colX = [NSMutableArray array], *colBottom = [NSMutableArray array];
+    for (UICollectionViewLayoutAttributes *a in attrs) {
+        if (a.representedElementCategory != UICollectionElementCategoryCell) continue;
+        CGFloat x = a.frame.origin.x, bottom = a.frame.origin.y + a.frame.size.height;
+        NSUInteger idx = NSNotFound;
+        for (NSUInteger i = 0; i < colX.count; i++) if (fabs(colX[i].doubleValue - x) < 1) { idx = i; break; }
+        if (idx == NSNotFound) { [colX addObject:@(x)]; [colBottom addObject:@(bottom)]; }
+        else if (bottom > colBottom[idx].doubleValue) colBottom[idx] = @(bottom);
+    }
+    if (colX.count == 0) return s;
+    CGFloat maxBottom = 0, newMax = 0;
+    for (NSUInteger i = 0; i < colX.count; i++) {
+        CGFloat cx = colX[i].doubleValue, bottom = colBottom[i].doubleValue, d = 0;
+        for (NSNumber *k in gNullInfo) {
+            CGRect ni = gNullInfo[k].CGRectValue;
+            if (fabs(ni.origin.x - cx) < 1) d += ni.size.height;
+        }
+        if (bottom > maxBottom) maxBottom = bottom;
+        if (bottom - d > newMax) newMax = bottom - d;
+    }
+    CGFloat tail = MAX((CGFloat)0, s.height - maxBottom);   // area di bawah kartu terbawah (footer, inset)
+    CGFloat newH = newMax + tail;
+    if (newH > 0 && newH < s.height - 1) {
+        gShrink = s.height - newH;
+        return CGSizeMake(s.width, newH);
+    }
+    return s;
+}
+
+static BOOL NA9InstallContentSizeHook(Class c) {
+    for (int i = 0; i < gCSCount; i++) if (gCSTab[i].cls == c) return YES;
+    if (gCSCount >= 2) return NO;
+    SEL sel = NSSelectorFromString(@"collectionViewContentSize");
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return NO;
+    IMP inherited = class_getMethodImplementation(c, sel);
+    const char *types = method_getTypeEncoding(m);
+    IMP orig;
+    if (class_addMethod(c, sel, (IMP)new_collectionViewContentSize, types)) orig = inherited;
+    else orig = method_setImplementation(class_getInstanceMethod(c, sel), (IMP)new_collectionViewContentSize);
+    if (!orig) return NO;
+    gCSTab[gCSCount].cls = c; gCSTab[gCSCount].orig = orig; gCSCount++;
+    return YES;
 }
 
 static BOOL NA9InstallLayoutHook(Class c) {
@@ -408,6 +512,8 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
     [gNullSCs addObject:sc];
     if (!NA9InstallLayoutHook([cv.collectionViewLayout class]))
         [log appendString:@"hook layout gagal dipasang\n"];
+    if (!NA9InstallContentSizeHook([cv.collectionViewLayout class]))
+        [log appendString:@"hook contentSize gagal dipasang\n"];
     NA9ForceRelayout(cv, [cv indexPathForCell:cell]);
 
     __weak UICollectionView *wcv = cv;
@@ -429,7 +535,7 @@ static void NA9CollapseNullItem(UICollectionViewCell *cell) {
         CGFloat nextY = CGFLOAT_MAX;
         for (UICollectionViewLayoutAttributes *a in as) {
             if (a == n || a.representedElementCategory != UICollectionElementCategoryCell) continue;
-            if (fabs(a.frame.origin.x - n.frame.origin.x) > 1 || a.frame.origin.y <= n.frame.origin.y + 0.5) continue;
+            if (fabs(a.frame.origin.x - n.frame.origin.x) > 1 || a.frame.origin.y < n.frame.origin.y - 0.5) continue;
             if (a.frame.origin.y < nextY) nextY = a.frame.origin.y;
         }
         if (nextY == CGFLOAT_MAX) return;
@@ -459,10 +565,11 @@ static void NA9HideNullCell(UILabel *label, NSString *text) {
         cell.userInteractionEnabled = NO;
         if (first) {
             __weak UICollectionViewCell *wcell = cell;
-            // Ditunda: jangan mengubah layout saat cell sedang dikonfigurasi.
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // Ditunda 0,25 dtk: jangan mengubah layout saat cell sedang dikonfigurasi, dan lewati kartu yang hanya
+            // sesaat berisi "(null)" (mis. skeleton yang segera terisi).
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 UICollectionViewCell *c = wcell;
-                if (c && c.hidden) NA9CollapseNullItem(c);
+                if (c && c.hidden && NA9HasNullLabel(c, 0)) NA9CollapseNullItem(c);
             });
         }
         return;
